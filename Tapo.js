@@ -1,5 +1,5 @@
 // =============================================================================
-// Tapo — SignalRGB Plugin  v3.0.0
+// Tapo — SignalRGB Plugin  v3.0.1
 // Supports all tapo-rest devices (L5xx, L6xx, L9xx, P1xx)
 // Requires: tapo-rest running locally (https://github.com/ClementNerma/tapo-rest)
 // Transport: XMLHttpRequest
@@ -44,7 +44,7 @@ let lastMode       = null;   // "hs" | "cct" — forces a resend when the mode f
 
 export function Name()      { return "Tapo"; }
 export function Publisher() { return "SignalRGB Community"; }
-export function Version()   { return "3.0.0"; }
+export function Version()   { return "3.0.1"; }
 export function Type()      { return "network"; }
 
 export function SubdeviceController() { return true; }
