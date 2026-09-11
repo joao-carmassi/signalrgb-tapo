@@ -23,12 +23,22 @@ let FRAME_SKIP  = 6;
 // Minimum HSV delta (0–100) before sending a new command
 let MIN_DELTA   = 3;
 
+// Saturation at or below this is treated as white and sent as a color
+// temperature instead of hue/saturation. The Tapo API rejects saturation=0
+// outright, and saturations of 1-10 render as tinted pastels rather than white.
+const WHITE_SAT_THRESHOLD = 8;
+
+// Clamp range accepted by the Tapo color-temperature API (Kelvin)
+const CCT_MIN = 2500;
+const CCT_MAX = 6500;
+
 let sessionToken   = null;
 let frameCounter   = 0;
 let requestPending = false;
 let lastHue        = -1;
 let lastSat        = -1;
 let lastBri        = -1;
+let lastMode       = null;   // "hs" | "cct" — forces a resend when the mode flips
 
 // -- Device identity ----------------------------------------------------------
 
@@ -287,18 +297,25 @@ export function Render() {
     const [h, s, v] = rgbToHsv(r, g, b);
     const scaledBri = Math.round(v * (parseInt(brightnessScale) / 100));
     const minDelta  = controller.minDelta;
+    const mode      = s <= WHITE_SAT_THRESHOLD ? "cct" : "hs";
+
+    // Near white the hue is numerically unstable — a ±1 wobble in one RGB
+    // channel swings it by tens of degrees — so only gate on it in color mode.
+    const hueSettled = mode === "cct" || Math.abs(h - lastHue) < minDelta;
 
     if (
-        Math.abs(h - lastHue)         < minDelta &&
+        mode === lastMode &&
+        hueSettled &&
         Math.abs(s - lastSat)         < minDelta &&
         Math.abs(scaledBri - lastBri) < minDelta
     ) return;
 
-    lastHue = h;
-    lastSat = s;
-    lastBri = scaledBri;
+    lastHue  = h;
+    lastSat  = s;
+    lastBri  = scaledBri;
+    lastMode = mode;
 
-    sendColor(h, s, scaledBri);
+    sendColor(h, s, scaledBri, mode, rgbToCct(r, g, b));
 }
 
 export function Shutdown() {
@@ -365,12 +382,12 @@ function login() {
     });
 }
 
-function sendColor(hue, saturation, bri) {
+function sendColor(hue, saturation, bri, mode, cct) {
     const dt   = controller.deviceType.toLowerCase();
     const dn   = controller.deviceName;
     const caps = deviceCaps(dt);
 
-    device.log(`[Tapo] [${dn}] sendColor h=${hue} s=${saturation} v=${bri} (color=${caps.color} dim=${caps.dim})`);
+    device.log(`[Tapo] [${dn}] sendColor mode=${mode} h=${hue} s=${saturation} v=${bri} cct=${cct} (color=${caps.color} dim=${caps.dim})`);
 
     // Turn off when brightness hits zero
     if (bri === 0) {
@@ -386,17 +403,34 @@ function sendColor(hue, saturation, bri) {
         return false;
     }
 
+    // Any non-2xx means the bulb kept its previous color — clear the cached
+    // state so the next frame retries instead of being skipped by the delta gate.
+    function checkFailure(label, status) {
+        if (status >= 200 && status < 300) return false;
+        device.log(`[Tapo] [${dn}] ${label} failed — HTTP ${status}`);
+        lastHue = lastSat = lastBri = -1;
+        lastMode = null;
+        return true;
+    }
+
     // All devices: turn on first
     httpGet(`/actions/${dt}/on?device=${dn}`, (s1) => {
         device.log(`[Tapo] [${dn}] /on → HTTP ${s1}`);
         if (handle401(s1)) return;
 
         if (caps.color) {
-            // Color devices: set hue/saturation then brightness
-            httpGet(`/actions/${dt}/set-hue-saturation?device=${dn}&hue=${hue}&saturation=${saturation}`, (s2) => {
+            const colorPath = mode === "cct"
+                // Whites: the Tapo API rejects saturation=0 and renders low
+                // saturations as tinted pastels, so use color-temperature mode.
+                ? `/actions/${dt}/set-color-temperature?device=${dn}&color_temperature=${cct}`
+                : `/actions/${dt}/set-hue-saturation?device=${dn}&hue=${hue}&saturation=${saturation}`;
+
+            httpGet(colorPath, (s2) => {
                 if (handle401(s2)) return;
+                checkFailure(mode === "cct" ? "set-color-temperature" : "set-hue-saturation", s2);
                 httpGet(`/actions/${dt}/set-brightness?device=${dn}&level=${bri}`, (s3) => {
                     if (s3 === 401) sessionToken = null;
+                    else checkFailure("set-brightness", s3);
                     requestPending = false;
                 });
             });
@@ -404,6 +438,7 @@ function sendColor(hue, saturation, bri) {
             // Dimmable only: set brightness
             httpGet(`/actions/${dt}/set-brightness?device=${dn}&level=${bri}`, (s2) => {
                 if (s2 === 401) sessionToken = null;
+                else checkFailure("set-brightness", s2);
                 requestPending = false;
             });
         } else {
@@ -452,7 +487,45 @@ function rgbToHsv(r, g, b) {
     const s = max === 0 ? 0 : (diff / max) * 100;
     const v = max * 100;
 
-    return [Math.round(h), Math.round(s), Math.round(v)];
+    // Saturation is clamped to 1 because the Tapo API rejects 0; anything that
+    // low is routed to color-temperature mode by the caller anyway.
+    return [
+        Math.min(360, Math.max(0, Math.round(h))),
+        Math.min(100, Math.max(1, Math.round(s))),
+        Math.min(100, Math.max(0, Math.round(v)))
+    ];
+}
+
+// RGB (0–255) → correlated color temperature in Kelvin, via sRGB → XYZ → xy
+// and McCamy's approximation. Used for near-white colors, where hue/saturation
+// cannot express the tint the canvas is asking for.
+function rgbToCct(r, g, b) {
+    // Linearize sRGB
+    const lin = (c) => {
+        c /= 255;
+        return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+    };
+    const R = lin(r), G = lin(g), B = lin(b);
+
+    const X = R * 0.4124 + G * 0.3576 + B * 0.1805;
+    const Y = R * 0.2126 + G * 0.7152 + B * 0.0722;
+    const Z = R * 0.0193 + G * 0.1192 + B * 0.9505;
+
+    const sum = X + Y + Z;
+    if (sum === 0) return 4000;
+
+    const x = X / sum;
+    const y = Y / sum;
+
+    // McCamy: n = (x - 0.3320) / (0.1858 - y)
+    const denom = 0.1858 - y;
+    if (Math.abs(denom) < 1e-6) return 4000;
+    const n = (x - 0.3320) / denom;
+
+    const cct = 437 * n * n * n + 3601 * n * n + 6861 * n + 5517;
+    if (!isFinite(cct)) return 4000;
+
+    return Math.round(Math.min(CCT_MAX, Math.max(CCT_MIN, cct)));
 }
 
 function hexToRgb(hex) {
