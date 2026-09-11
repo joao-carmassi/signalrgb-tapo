@@ -1,5 +1,5 @@
 // =============================================================================
-// Tapo — SignalRGB Plugin  v3.0.2
+// Tapo — SignalRGB Plugin  v3.0.3
 // Supports all tapo-rest devices (L5xx, L6xx, L9xx, P1xx)
 // Requires: tapo-rest running locally (https://github.com/ClementNerma/tapo-rest)
 // Transport: XMLHttpRequest
@@ -52,11 +52,22 @@ const DARK_V_FLOOR = 4;
 // very hunting this is meant to stop.
 const CCT_TRUST_V_LO = 15;
 const CCT_TRUST_V_HI = 35;
+
+// The same argument applies to chroma itself. At a chroma of 1 or 2 the scene
+// is the display white point plus rounding, and the Kelvin figure derived from
+// it swings freely, so a bright neutral screen would chatter. Trust the
+// estimate only once there is real chroma to measure.
+const CCT_TRUST_C_LO = 2;
+const CCT_TRUST_C_HI = 6;
+
 const CCT_NEUTRAL    = 6500;   // D65, the sRGB white point
 
-// Minimum change in Kelvin before a new color temperature is sent. Roughly the
-// just-noticeable difference for a bulb in this range.
-const CCT_DELTA = 120;
+// Minimum change in Kelvin before a new color temperature is sent. This bounds
+// how far the settled white can sit from the screen, so two crossfades onto the
+// same white from different covers can differ by up to twice this. Measured on
+// an eased crossfade: 120 leaves a 133K spread, 60 converges exactly, and the
+// extra traffic stays well under the ceiling frameSkip already imposes.
+const CCT_DELTA = 60;
 
 // Clamp range accepted by the Tapo color-temperature API (Kelvin)
 const CCT_MIN = 2500;
@@ -75,7 +86,7 @@ let lastMode       = null;   // "hs" | "cct" — forces a resend when the mode f
 
 export function Name()      { return "Tapo"; }
 export function Publisher() { return "SignalRGB Community"; }
-export function Version()   { return "3.0.2"; }
+export function Version()   { return "3.0.3"; }
 export function Type()      { return "network"; }
 
 export function SubdeviceController() { return true; }
@@ -327,9 +338,9 @@ export function Render() {
 
     const [h, s, v] = rgbToHsv(r, g, b);
     const scaledBri = Math.round(v * (parseInt(brightnessScale) / 100));
-    const cct       = trustedCct(r, g, b, v);
     const minDelta  = controller.minDelta;
     const chroma    = Math.max(r, g, b) - Math.min(r, g, b);
+    const cct       = trustedCct(r, g, b, v, chroma);
 
     // Pick the bulb mode from absolute chroma, with hysteresis around the
     // boundary and a hard floor for very dark scenes.
@@ -518,8 +529,12 @@ function averageCanvas() {
 
 // Color temperature for a frame, faded toward the display white point as the
 // scene gets too dark for its chromaticity to mean anything.
-function trustedCct(r, g, b, v) {
-    const w = Math.min(1, Math.max(0, (v - CCT_TRUST_V_LO) / (CCT_TRUST_V_HI - CCT_TRUST_V_LO)));
+function trustedCct(r, g, b, v, chroma) {
+    const ramp = (x, lo, hi) => Math.min(1, Math.max(0, (x - lo) / (hi - lo)));
+    const w = Math.min(
+        ramp(v,      CCT_TRUST_V_LO, CCT_TRUST_V_HI),
+        ramp(chroma, CCT_TRUST_C_LO, CCT_TRUST_C_HI),
+    );
     if (w === 0) return CCT_NEUTRAL;
     const raw = rgbToCct(r, g, b);
     return Math.round(CCT_NEUTRAL + w * (raw - CCT_NEUTRAL));
