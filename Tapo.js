@@ -1,5 +1,5 @@
 // =============================================================================
-// Tapo — SignalRGB Plugin  v3.0.1
+// Tapo — SignalRGB Plugin  v3.0.2
 // Supports all tapo-rest devices (L5xx, L6xx, L9xx, P1xx)
 // Requires: tapo-rest running locally (https://github.com/ClementNerma/tapo-rest)
 // Transport: XMLHttpRequest
@@ -23,10 +23,40 @@ let FRAME_SKIP  = 6;
 // Minimum HSV delta (0–100) before sending a new command
 let MIN_DELTA   = 3;
 
-// Saturation at or below this is treated as white and sent as a color
+// Colors this close to neutral are treated as white and sent as a color
 // temperature instead of hue/saturation. The Tapo API rejects saturation=0
 // outright, and saturations of 1-10 render as tinted pastels rather than white.
-const WHITE_SAT_THRESHOLD = 8;
+//
+// The test is absolute chroma (max channel - min channel, 0-255), NOT HSV
+// saturation. Saturation is a ratio, so on a dark screen a one-unit channel
+// imbalance reads as a large saturation with an essentially random hue:
+// (10,10,11) is visually black but scores saturation 9, hue 240. Absolute
+// chroma is scale-invariant and stays small when the scene really is neutral.
+//
+// The two thresholds form a hysteresis band. A scene parked on a single
+// boundary would otherwise flip modes on sensor noise alone, and a mode flip
+// bypasses the whole delta gate.
+const CHROMA_ENTER_COLOR = 24;   // rise above this to leave white mode
+const CHROMA_STAY_COLOR  = 16;   // fall below this to return to white mode
+
+// Below this value (HSV V, 0-100) chroma carries no usable signal at all, so
+// the scene is driven as dim white rather than as a noise-derived hue.
+const DARK_V_FLOOR = 4;
+
+// Chromaticity is scale-invariant, so a one-unit channel difference is a
+// rounding error at RGB 255 but a large chromatic shift at RGB 20. Below
+// CCT_TRUST_V_LO the Kelvin estimate is reading quantization noise, so a dark
+// neutral scene is pinned to the display's own white point; above
+// CCT_TRUST_V_HI it is used as computed. In between it is blended, because a
+// hard cutoff is a cliff that dither walks back and forth across, which is the
+// very hunting this is meant to stop.
+const CCT_TRUST_V_LO = 15;
+const CCT_TRUST_V_HI = 35;
+const CCT_NEUTRAL    = 6500;   // D65, the sRGB white point
+
+// Minimum change in Kelvin before a new color temperature is sent. Roughly the
+// just-noticeable difference for a bulb in this range.
+const CCT_DELTA = 120;
 
 // Clamp range accepted by the Tapo color-temperature API (Kelvin)
 const CCT_MIN = 2500;
@@ -38,13 +68,14 @@ let requestPending = false;
 let lastHue        = -1;
 let lastSat        = -1;
 let lastBri        = -1;
+let lastCct        = -1;
 let lastMode       = null;   // "hs" | "cct" — forces a resend when the mode flips
 
 // -- Device identity ----------------------------------------------------------
 
 export function Name()      { return "Tapo"; }
 export function Publisher() { return "SignalRGB Community"; }
-export function Version()   { return "3.0.1"; }
+export function Version()   { return "3.0.2"; }
 export function Type()      { return "network"; }
 
 export function SubdeviceController() { return true; }
@@ -296,26 +327,43 @@ export function Render() {
 
     const [h, s, v] = rgbToHsv(r, g, b);
     const scaledBri = Math.round(v * (parseInt(brightnessScale) / 100));
+    const cct       = trustedCct(r, g, b, v);
     const minDelta  = controller.minDelta;
-    const mode      = s <= WHITE_SAT_THRESHOLD ? "cct" : "hs";
+    const chroma    = Math.max(r, g, b) - Math.min(r, g, b);
 
-    // Near white the hue is numerically unstable — a ±1 wobble in one RGB
-    // channel swings it by tens of degrees — so only gate on it in color mode.
-    const hueSettled = mode === "cct" || Math.abs(h - lastHue) < minDelta;
+    // Pick the bulb mode from absolute chroma, with hysteresis around the
+    // boundary and a hard floor for very dark scenes.
+    let mode;
+    if (v < DARK_V_FLOOR)        mode = "cct";
+    else if (lastMode === "hs")  mode = chroma > CHROMA_STAY_COLOR  ? "hs" : "cct";
+    else                         mode = chroma > CHROMA_ENTER_COLOR ? "hs" : "cct";
+
+    // Gate on whatever this mode actually transmits. In white mode that is the
+    // Kelvin value, which no combination of hue, saturation and brightness
+    // stands in for: two whites of opposite tint share the same saturation, so
+    // gating on saturation lets the bulb park on a stale tint indefinitely.
+    const colorSettled = mode === "cct"
+        ? Math.abs(cct - lastCct) < CCT_DELTA
+        : hueDelta(h, lastHue) < minDelta && Math.abs(s - lastSat) < minDelta;
+
+    // Switching the bulb on or off is not a delta. A fade whose last step into
+    // black is smaller than minDelta would otherwise leave the bulb lit at 1%.
+    const powerChanged = (scaledBri === 0) !== (lastBri === 0);
 
     if (
+        !powerChanged &&
         mode === lastMode &&
-        hueSettled &&
-        Math.abs(s - lastSat)         < minDelta &&
+        colorSettled &&
         Math.abs(scaledBri - lastBri) < minDelta
     ) return;
 
     lastHue  = h;
     lastSat  = s;
     lastBri  = scaledBri;
+    lastCct  = cct;
     lastMode = mode;
 
-    sendColor(h, s, scaledBri, mode, rgbToCct(r, g, b));
+    sendColor(h, s, scaledBri, mode, cct);
 }
 
 export function Shutdown() {
@@ -408,7 +456,7 @@ function sendColor(hue, saturation, bri, mode, cct) {
     function checkFailure(label, status) {
         if (status >= 200 && status < 300) return false;
         device.log(`[Tapo] [${dn}] ${label} failed — HTTP ${status}`);
-        lastHue = lastSat = lastBri = -1;
+        lastHue = lastSat = lastBri = lastCct = -1;
         lastMode = null;
         return true;
     }
@@ -466,6 +514,25 @@ function averageCanvas() {
         Math.round(gSum / count),
         Math.round(bSum / count)
     ];
+}
+
+// Color temperature for a frame, faded toward the display white point as the
+// scene gets too dark for its chromaticity to mean anything.
+function trustedCct(r, g, b, v) {
+    const w = Math.min(1, Math.max(0, (v - CCT_TRUST_V_LO) / (CCT_TRUST_V_HI - CCT_TRUST_V_LO)));
+    if (w === 0) return CCT_NEUTRAL;
+    const raw = rgbToCct(r, g, b);
+    return Math.round(CCT_NEUTRAL + w * (raw - CCT_NEUTRAL));
+}
+
+// Shortest angular distance between two hues, in degrees (0–180). Hue is
+// circular, so a plain subtraction reports 358 for the 1-degree gap between
+// 359 and 0 — which would defeat the rate limit on red content.
+// A negative previous hue means "nothing cached yet", so report max distance.
+function hueDelta(a, b) {
+    if (b < 0) return 180;
+    const d = Math.abs(a - b) % 360;
+    return d > 180 ? 360 - d : d;
 }
 
 // RGB (0–255) → [H 0–360, S 0–100, V 0–100]
