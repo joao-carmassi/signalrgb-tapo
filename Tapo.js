@@ -1,5 +1,5 @@
 // =============================================================================
-// Tapo — SignalRGB Plugin  v3.0.3
+// Tapo — SignalRGB Plugin  v3.1.0
 // Supports all tapo-rest devices (L5xx, L6xx, L9xx, P1xx)
 // Requires: tapo-rest running locally (https://github.com/ClementNerma/tapo-rest)
 // Transport: XMLHttpRequest
@@ -10,6 +10,8 @@
 var LightingMode    = "Canvas";
 var forcedColor     = "0099ff";
 var brightnessScale = "100";
+var updateInterval  = "0";
+var intervalSampling = "Average";
 
 // -- Configuration ------------------------------------------------------------
 
@@ -82,11 +84,20 @@ let lastBri        = -1;
 let lastCct        = -1;
 let lastMode       = null;   // "hs" | "cct" — forces a resend when the mode flips
 
+// Timed updates (updateInterval > 0): one color per window, sent at its end,
+// leaving the device to fade to it. The first frame opens no window.
+let windowStart = -Infinity;
+let sumR = 0, sumG = 0, sumB = 0, sampleCount = 0;
+
+// Whether tapo-rest has the combined `set` action. null until the first
+// attempt; false once the route turns out to be missing (older tapo-rest).
+let combinedSet = null;
+
 // -- Device identity ----------------------------------------------------------
 
 export function Name()      { return "Tapo"; }
 export function Publisher() { return "SignalRGB Community"; }
-export function Version()   { return "3.0.3"; }
+export function Version()   { return "3.1.0"; }
 export function Type()      { return "network"; }
 
 export function SubdeviceController() { return true; }
@@ -302,6 +313,24 @@ export function ControllableParameters() {
             max:      "100",
             step:     "1",
             default:  "100"
+        },
+        {
+            property: "updateInterval",
+            group:    "lighting",
+            label:    "Update Interval (s)",
+            type:     "number",
+            min:      "0",
+            max:      "30",
+            step:     "1",
+            default:  "0"
+        },
+        {
+            property: "intervalSampling",
+            group:    "lighting",
+            label:    "Interval Sampling",
+            type:     "combobox",
+            values:   ["Average", "Last Frame"],
+            default:  "Average"
         }
     ];
 }
@@ -322,18 +351,39 @@ export function Render() {
         return;
     }
 
-    frameCounter++;
-    if (frameCounter < controller.frameSkip) return;
-    frameCounter = 0;
-
-    if (requestPending) return;
-
     let r, g, b;
+    const sample = () => LightingMode === "Forced" ? hexToRgb(forcedColor) : averageCanvas();
+    const intervalMs = (parseFloat(updateInterval) || 0) * 1000;
 
-    if (LightingMode === "Forced") {
-        [r, g, b] = hexToRgb(forcedColor);
+    if (intervalMs > 0) {
+        // Every device command starts a fade that the next command cuts short,
+        // so a fast stream reads as hard cuts. Send one color per window.
+        //   Average    — mean of the window; steady, never lands on the dark gap
+        //                between beats, but opposing colors blend together.
+        //   Last Frame — the canvas as the window closes; keeps colors vivid,
+        //                but which beat it catches is arbitrary.
+        [r, g, b] = sample();
+        sumR += r; sumG += g; sumB += b; sampleCount++;
+
+        const now = Date.now();
+        if (now - windowStart < intervalMs || requestPending) return;
+
+        if (intervalSampling !== "Last Frame") {
+            r = Math.round(sumR / sampleCount);
+            g = Math.round(sumG / sampleCount);
+            b = Math.round(sumB / sampleCount);
+        }
+        sumR = sumG = sumB = sampleCount = 0;
+        windowStart = now;
     } else {
-        [r, g, b] = averageCanvas();
+        sumR = sumG = sumB = sampleCount = 0;
+        frameCounter++;
+        if (frameCounter < controller.frameSkip) return;
+        frameCounter = 0;
+
+        if (requestPending) return;
+
+        [r, g, b] = sample();
     }
 
     const [h, s, v] = rgbToHsv(r, g, b);
@@ -467,9 +517,33 @@ function sendColor(hue, saturation, bri, mode, cct) {
     function checkFailure(label, status) {
         if (status >= 200 && status < 300) return false;
         device.log(`[Tapo] [${dn}] ${label} failed — HTTP ${status}`);
-        lastHue = lastSat = lastBri = lastCct = -1;
-        lastMode = null;
+        invalidateSentState();
         return true;
+    }
+
+    const colorParams = mode === "cct"
+        // Whites: the Tapo API rejects saturation=0 and renders low
+        // saturations as tinted pastels, so use color-temperature mode.
+        ? `color_temperature=${cct}`
+        : `hue=${hue}&saturation=${saturation}`;
+
+    // Color and brightness in one device command. Sent separately, the
+    // brightness command lands mid-way through the color fade and cuts it off.
+    // Setting brightness also turns the device on, so no /on is needed.
+    if (caps.color && combinedSet !== false) {
+        httpGet(`/actions/${dt}/set?device=${dn}&brightness=${bri}&${colorParams}`, (status, body) => {
+            if (handle401(status)) return;
+            // An unknown route is a bare 404; a missing device carries a message.
+            if (status === 404 && !body) {
+                device.log(`[Tapo] [${dn}] tapo-rest has no /set action — using separate commands`);
+                combinedSet = false;
+                invalidateSentState();
+            } else if (!checkFailure("set", status)) {
+                combinedSet = true;
+            }
+            requestPending = false;
+        });
+        return;
     }
 
     // All devices: turn on first
@@ -479,10 +553,8 @@ function sendColor(hue, saturation, bri, mode, cct) {
 
         if (caps.color) {
             const colorPath = mode === "cct"
-                // Whites: the Tapo API rejects saturation=0 and renders low
-                // saturations as tinted pastels, so use color-temperature mode.
-                ? `/actions/${dt}/set-color-temperature?device=${dn}&color_temperature=${cct}`
-                : `/actions/${dt}/set-hue-saturation?device=${dn}&hue=${hue}&saturation=${saturation}`;
+                ? `/actions/${dt}/set-color-temperature?device=${dn}&${colorParams}`
+                : `/actions/${dt}/set-hue-saturation?device=${dn}&${colorParams}`;
 
             httpGet(colorPath, (s2) => {
                 if (handle401(s2)) return;
@@ -505,6 +577,12 @@ function sendColor(hue, saturation, bri, mode, cct) {
             requestPending = false;
         }
     });
+}
+
+// Forget what was last sent, so the delta gate lets the next frame through.
+function invalidateSentState() {
+    lastHue = lastSat = lastBri = lastCct = -1;
+    lastMode = null;
 }
 
 // -- Canvas / color helpers ---------------------------------------------------

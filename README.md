@@ -30,6 +30,8 @@ Follow the tapo-rest setup guide to:
 - Add your devices by name (e.g. `desk-light`)
 - Start the server (defaults to `127.0.0.1:8000`)
 
+For color devices the plugin prefers tapo-rest's combined `set` action, which applies color and brightness in one device command so the device's fade is not interrupted halfway. Builds without it fall back automatically to separate `on`, color and brightness commands.
+
 ### 2. SignalRGB
 
 [Download SignalRGB](https://signalrgb.com) if you haven't already.
@@ -72,6 +74,8 @@ Hit **Apply** to save and immediately reconnect. Devices will be re-discovered a
 | Lighting Mode | `Canvas` | `Canvas` syncs to screen average; `Forced` uses a fixed color |
 | Forced Color | `#0099ff` | Color used when Lighting Mode is set to Forced |
 | Brightness | `100%` | Scales the brightness output (1–100%) |
+| Update Interval (s) | `0` | Send at most one color every N seconds and let the device fade to it, instead of following the canvas frame by frame. `0` keeps the Frame Skip behavior. Useful for music effects, where a fast stream of commands keeps cutting the device's own fade short. |
+| Interval Sampling | `Average` | With an interval set: `Average` sends the mean color of the window (steady, but opposing colors blend); `Last Frame` sends the canvas as the window closes (vivid, but it catches an arbitrary beat). |
 
 ---
 
