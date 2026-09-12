@@ -74,7 +74,7 @@ Hit **Apply** to save and immediately reconnect. Devices will be re-discovered a
 | Lighting Mode | `Canvas` | `Canvas` syncs to screen average; `Forced` uses a fixed color |
 | Forced Color | `#0099ff` | Color used when Lighting Mode is set to Forced |
 | Brightness | `100%` | Scales the brightness output (1–100%) |
-| Update Interval (s) | `0` | Send at most one color every N seconds and let the device fade to it, instead of following the canvas frame by frame. `0` keeps the Frame Skip behavior. Useful for music effects, where a fast stream of commands keeps cutting the device's own fade short. |
+| Update Interval (s) | `0` | Pick one color every N seconds and glide to it in steps about as long as the device's own ~1 s fade, so consecutive changes flow into each other instead of fading and pausing. `0` keeps the Frame Skip behavior. Useful for music effects, where a fast stream of commands keeps cutting the device's own fade short. |
 | Interval Sampling | `Average` | With an interval set: `Average` sends the mean color of the window (steady, but opposing colors blend); `Last Frame` sends the canvas as the window closes (vivid, but it catches an arbitrary beat). |
 
 ---

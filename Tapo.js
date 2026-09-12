@@ -1,5 +1,5 @@
 // =============================================================================
-// Tapo — SignalRGB Plugin  v3.1.0
+// Tapo — SignalRGB Plugin  v3.1.1
 // Supports all tapo-rest devices (L5xx, L6xx, L9xx, P1xx)
 // Requires: tapo-rest running locally (https://github.com/ClementNerma/tapo-rest)
 // Transport: XMLHttpRequest
@@ -89,6 +89,19 @@ let lastMode       = null;   // "hs" | "cct" — forces a resend when the mode f
 let windowStart = -Infinity;
 let sumR = 0, sumG = 0, sumB = 0, sampleCount = 0;
 
+// How long the device takes to fade to a new state on its own (~1 s on an
+// L530). A window longer than this would fade and then sit still until the
+// next window, so a sequence of changes reads as change, pause, change. The
+// move to each window's color is instead split into steps this long, each
+// heading for an intermediate color, so one fade runs straight into the next.
+const DEVICE_FADE_MS = 1000;
+
+let glideFrom  = null;   // [r,g,b] the current glide starts from
+let glideTo    = null;   // [r,g,b] the window color it ends on
+let glideSent  = null;   // [r,g,b] the last step handed to the device
+let glideSteps = 0;
+let glideStep  = 0;
+
 // Whether tapo-rest has the combined `set` action. null until the first
 // attempt; false once the route turns out to be missing (older tapo-rest).
 let combinedSet = null;
@@ -97,7 +110,7 @@ let combinedSet = null;
 
 export function Name()      { return "Tapo"; }
 export function Publisher() { return "SignalRGB Community"; }
-export function Version()   { return "3.1.0"; }
+export function Version()   { return "3.1.1"; }
 export function Type()      { return "network"; }
 
 export function SubdeviceController() { return true; }
@@ -366,17 +379,29 @@ export function Render() {
         sumR += r; sumG += g; sumB += b; sampleCount++;
 
         const now = Date.now();
-        if (now - windowStart < intervalMs || requestPending) return;
+        if (now - windowStart >= intervalMs) {
+            const target = intervalSampling === "Last Frame"
+                ? [r, g, b]
+                : [sumR, sumG, sumB].map((sum) => Math.round(sum / sampleCount));
+            sumR = sumG = sumB = sampleCount = 0;
+            windowStart = now;
 
-        if (intervalSampling !== "Last Frame") {
-            r = Math.round(sumR / sampleCount);
-            g = Math.round(sumG / sampleCount);
-            b = Math.round(sumB / sampleCount);
+            // Glide from wherever the device was last sent, which is short of
+            // the previous window color if its steps were held back.
+            glideFrom  = glideSent || target;
+            glideTo    = target;
+            glideSteps = Math.max(1, Math.round(intervalMs / DEVICE_FADE_MS));
+            glideStep  = 0;
         }
-        sumR = sumG = sumB = sampleCount = 0;
-        windowStart = now;
+
+        const stepDue = windowStart + glideStep * (intervalMs / glideSteps);
+        if (glideTo === null || glideStep >= glideSteps || now < stepDue || requestPending) return;
+
+        glideStep++;
+        [r, g, b] = glideSent = mixColors(glideFrom, glideTo, glideStep / glideSteps);
     } else {
         sumR = sumG = sumB = sampleCount = 0;
+        glideFrom = glideTo = glideSent = null;
         frameCounter++;
         if (frameCounter < controller.frameSkip) return;
         frameCounter = 0;
@@ -577,6 +602,17 @@ function sendColor(hue, saturation, bri, mode, cct) {
             requestPending = false;
         }
     });
+}
+
+// Blend two RGB colors at t (0–1). The peak channel is interpolated separately
+// so brightness moves in a straight line: a plain RGB mix of red and blue
+// passes through a half-bright purple, which would read as a dip.
+function mixColors(from, to, t) {
+    const mixed = from.map((c, i) => c + (to[i] - c) * t);
+    const peak  = Math.max(...from) + (Math.max(...to) - Math.max(...from)) * t;
+    const max   = Math.max(...mixed);
+    const scale = max > 0 ? peak / max : 0;
+    return mixed.map((c) => Math.round(Math.min(255, c * scale)));
 }
 
 // Forget what was last sent, so the delta gate lets the next frame through.
