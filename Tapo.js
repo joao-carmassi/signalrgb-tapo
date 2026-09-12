@@ -1,5 +1,5 @@
 // =============================================================================
-// Tapo — SignalRGB Plugin  v3.1.5
+// Tapo — SignalRGB Plugin  v3.2.0
 // Supports all tapo-rest devices (L5xx, L6xx, L9xx, P1xx)
 // Requires: tapo-rest running locally (https://github.com/ClementNerma/tapo-rest)
 // Transport: XMLHttpRequest
@@ -121,6 +121,20 @@ let sumR = 0, sumG = 0, sumB = 0, sampleCount = 0;
 // heading for an intermediate color, so one fade runs straight into the next.
 const DEVICE_FADE_MS = 1000;
 
+// The device fades at a limited speed rather than over a fixed time: a large
+// change takes the full ~1 s, a small one (brightness 60 -> 50, hue +20)
+// finishes in a fraction of that and reads as a hitch. Measured on an L530.
+// So in timed mode a window whose color is only a small step from what the
+// device already shows is skipped, and a glide is only split while every
+// step stays large enough to get the full fade.
+//
+// Distances are RGB Euclidean, normalised by the brighter color's peak so a
+// change in a dim scene counts as much as the same relative change in a
+// bright one. On that scale the hitching changes above measure 52-60, while
+// brightness 60 -> 30 (182) and hue 186 -> 260 (148) got the full fade.
+const MIN_VISIBLE_CHANGE = 80;
+const MIN_GLIDE_STEP     = 140;
+
 let glideFrom  = null;   // [r,g,b] the current glide starts from
 let glideTo    = null;   // [r,g,b] the window color it ends on
 let glideSent  = null;   // [r,g,b] the last step handed to the device
@@ -139,7 +153,7 @@ const COMBINED_SET_RETRY_MS = 60000;
 
 export function Name()      { return "Tapo"; }
 export function Publisher() { return "SignalRGB Community"; }
-export function Version()   { return "3.1.5"; }
+export function Version()   { return "3.2.0"; }
 export function Type()      { return "network"; }
 
 export function SubdeviceController() { return true; }
@@ -416,11 +430,19 @@ export function Render() {
             windowStart = now;
 
             // Glide from wherever the device was last sent, which is short of
-            // the previous window color if its steps were held back.
-            glideFrom  = glideSent || target;
-            glideTo    = target;
-            glideSteps = Math.max(1, Math.round(intervalMs / DEVICE_FADE_MS));
-            glideStep  = 0;
+            // the previous window color if its steps were held back. A window
+            // that barely moves is dropped, leaving any glide in progress be.
+            const from = glideSent || target;
+            const dist = colorDistance(from, target);
+            if (glideSent === null || dist >= MIN_VISIBLE_CHANGE || isLit(from) !== isLit(target)) {
+                glideFrom  = from;
+                glideTo    = target;
+                glideSteps = Math.max(1, Math.min(
+                    Math.round(intervalMs / DEVICE_FADE_MS),
+                    Math.floor(dist / MIN_GLIDE_STEP),
+                ));
+                glideStep  = 0;
+            }
         }
 
         const stepDue = windowStart + glideStep * (intervalMs / glideSteps);
@@ -643,6 +665,18 @@ function sendColor(hue, saturation, bri, mode, cct) {
             requestPending = false;
         }
     });
+}
+
+// Distance between two RGB colors, normalised by the brighter one's peak (with a
+// floor, so near-black noise does not blow up) onto a 0–255-ish scale.
+function colorDistance(a, b) {
+    const peak = Math.max(64, ...a, ...b);
+    return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) / peak * 255;
+}
+
+// Whether a color would switch the device on (it rounds to brightness 1+).
+function isLit(c) {
+    return Math.max(...c) >= 2;
 }
 
 // Blend two RGB colors at t (0–1). The peak channel is interpolated separately
