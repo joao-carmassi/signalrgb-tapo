@@ -1,5 +1,5 @@
 // =============================================================================
-// Tapo — SignalRGB Plugin  v3.1.4
+// Tapo — SignalRGB Plugin  v3.1.5
 // Supports all tapo-rest devices (L5xx, L6xx, L9xx, P1xx)
 // Requires: tapo-rest running locally (https://github.com/ClementNerma/tapo-rest)
 // Transport: XMLHttpRequest
@@ -62,11 +62,13 @@ const DIM_SAT_STAY_COLOR     = 30;
 const DIM_CHROMA_ENTER_COLOR = 8;
 const DIM_CHROMA_STAY_COLOR  = 5;
 
-// Below this value (HSV V, 0-100) chroma carries no usable signal at all. A
-// scene that was already white stays dim white; one fading out from a color
-// keeps that color's hue and saturation, so a fade to black does not pass
-// through white or a noise-derived hue on the way down.
+// Below this value (HSV V, 0-100) hue carries no usable signal. A color fading
+// out keeps the hue and saturation it had, so a fade to black does not pass
+// through white or a noise-derived hue on the way down; it is still recognised
+// by its saturation, which survives dimming (orange at (10,4,1) scores 90).
+// A dark gray does not, (8,8,8) scores 0, so it goes to dim white.
 const DARK_V_FLOOR = 4;
+const DARK_CHROMA_STAY_COLOR = 2;
 
 // Chromaticity is scale-invariant, so a one-unit channel difference is a
 // rounding error at RGB 255 but a large chromatic shift at RGB 20. Below
@@ -137,7 +139,7 @@ const COMBINED_SET_RETRY_MS = 60000;
 
 export function Name()      { return "Tapo"; }
 export function Publisher() { return "SignalRGB Community"; }
-export function Version()   { return "3.1.4"; }
+export function Version()   { return "3.1.5"; }
 export function Type()      { return "network"; }
 
 export function SubdeviceController() { return true; }
@@ -451,8 +453,9 @@ export function Render() {
         chroma > chromaMin || (s >= satMin && chroma >= dimChromaMin);
     let mode;
     if (v < DARK_V_FLOOR) {
-        mode = lastMode === "hs" ? "hs" : "cct";
-        if (mode === "hs") { h = lastHue; s = lastSat; }
+        const fadingColor = lastMode === "hs" && s >= DIM_SAT_STAY_COLOR && chroma >= DARK_CHROMA_STAY_COLOR;
+        mode = fadingColor ? "hs" : "cct";
+        if (fadingColor) { h = lastHue; s = lastSat; }
     }
     else if (lastMode === "hs") mode = isColor(CHROMA_STAY_COLOR,  DIM_SAT_STAY_COLOR,  DIM_CHROMA_STAY_COLOR)  ? "hs" : "cct";
     else                        mode = isColor(CHROMA_ENTER_COLOR, DIM_SAT_ENTER_COLOR, DIM_CHROMA_ENTER_COLOR) ? "hs" : "cct";
