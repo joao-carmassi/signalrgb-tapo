@@ -1,5 +1,5 @@
 // =============================================================================
-// Tapo — SignalRGB Plugin  v3.1.3
+// Tapo — SignalRGB Plugin  v3.1.4
 // Supports all tapo-rest devices (L5xx, L6xx, L9xx, P1xx)
 // Requires: tapo-rest running locally (https://github.com/ClementNerma/tapo-rest)
 // Transport: XMLHttpRequest
@@ -52,8 +52,20 @@ let MIN_DELTA   = 3;
 const CHROMA_ENTER_COLOR = 24;   // rise above this to leave white mode
 const CHROMA_STAY_COLOR  = 16;   // fall below this to return to white mode
 
-// Below this value (HSV V, 0-100) chroma carries no usable signal at all, so
-// the scene is driven as dim white rather than as a noise-derived hue.
+// Absolute chroma alone misreads dim colors: a purple pulse fading to
+// (20,12,22) has a chroma of 10 and would be sent as white, so music that
+// pulses between a color and darkness flashed white in between. A dim scene
+// still counts as color when its saturation is high AND its chroma is clear of
+// the one-or-two-unit noise that makes (10,10,11) score saturation 9.
+const DIM_SAT_ENTER_COLOR    = 40;
+const DIM_SAT_STAY_COLOR     = 30;
+const DIM_CHROMA_ENTER_COLOR = 8;
+const DIM_CHROMA_STAY_COLOR  = 5;
+
+// Below this value (HSV V, 0-100) chroma carries no usable signal at all. A
+// scene that was already white stays dim white; one fading out from a color
+// keeps that color's hue and saturation, so a fade to black does not pass
+// through white or a noise-derived hue on the way down.
 const DARK_V_FLOOR = 4;
 
 // Chromaticity is scale-invariant, so a one-unit channel difference is a
@@ -125,7 +137,7 @@ const COMBINED_SET_RETRY_MS = 60000;
 
 export function Name()      { return "Tapo"; }
 export function Publisher() { return "SignalRGB Community"; }
-export function Version()   { return "3.1.3"; }
+export function Version()   { return "3.1.4"; }
 export function Type()      { return "network"; }
 
 export function SubdeviceController() { return true; }
@@ -426,18 +438,24 @@ export function Render() {
         [r, g, b] = sample();
     }
 
-    const [h, s, v] = rgbToHsv(r, g, b);
+    let [h, s, v] = rgbToHsv(r, g, b);
     const scaledBri = Math.round(v * (parseInt(brightnessPct()) / 100));
     const minDelta  = controller.minDelta;
     const chroma    = Math.max(r, g, b) - Math.min(r, g, b);
     const cct       = trustedCct(r, g, b, v, chroma);
 
-    // Pick the bulb mode from absolute chroma, with hysteresis around the
-    // boundary and a hard floor for very dark scenes.
+    // Pick the bulb mode from chroma (or, for dim scenes, saturation backed by
+    // enough chroma to rule out noise), with hysteresis around the boundary
+    // and a floor for very dark scenes.
+    const isColor = (chromaMin, satMin, dimChromaMin) =>
+        chroma > chromaMin || (s >= satMin && chroma >= dimChromaMin);
     let mode;
-    if (v < DARK_V_FLOOR)        mode = "cct";
-    else if (lastMode === "hs")  mode = chroma > CHROMA_STAY_COLOR  ? "hs" : "cct";
-    else                         mode = chroma > CHROMA_ENTER_COLOR ? "hs" : "cct";
+    if (v < DARK_V_FLOOR) {
+        mode = lastMode === "hs" ? "hs" : "cct";
+        if (mode === "hs") { h = lastHue; s = lastSat; }
+    }
+    else if (lastMode === "hs") mode = isColor(CHROMA_STAY_COLOR,  DIM_SAT_STAY_COLOR,  DIM_CHROMA_STAY_COLOR)  ? "hs" : "cct";
+    else                        mode = isColor(CHROMA_ENTER_COLOR, DIM_SAT_ENTER_COLOR, DIM_CHROMA_ENTER_COLOR) ? "hs" : "cct";
 
     // Gate on whatever this mode actually transmits. In white mode that is the
     // Kelvin value, which no combination of hue, saturation and brightness
