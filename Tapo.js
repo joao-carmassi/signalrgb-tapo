@@ -1,17 +1,28 @@
 // =============================================================================
-// Tapo — SignalRGB Plugin  v3.1.2
+// Tapo — SignalRGB Plugin  v3.1.3
 // Supports all tapo-rest devices (L5xx, L6xx, L9xx, P1xx)
 // Requires: tapo-rest running locally (https://github.com/ClementNerma/tapo-rest)
 // Transport: XMLHttpRequest
 // =============================================================================
 
-// Controllable parameter globals — declared as var so the SignalRGB runtime
-// can overwrite them; defaults are used until the first Render() injection.
-var LightingMode    = "Canvas";
-var forcedColor     = "0099ff";
-var brightnessScale = "100";
-var updateInterval  = "0";
-var intervalSampling = "Average";
+/* global
+LightingMode:readonly
+forcedColor:readonly
+brightnessScale:readonly
+updateInterval:readonly
+intervalSampling:readonly
+*/
+
+// SignalRGB exposes each controllable parameter as a global of the same name.
+// This file is an ES module, so declaring one here (`var LightingMode = ...`)
+// creates a module-scoped variable that shadows the global, and the setting
+// stays pinned to its default no matter what the user picks. Read the globals
+// directly, falling back to the default until the runtime has defined them.
+const lightingMode    = () => typeof LightingMode     !== "undefined" ? LightingMode     : "Canvas";
+const forcedColorHex  = () => typeof forcedColor      !== "undefined" ? forcedColor      : "0099ff";
+const brightnessPct   = () => typeof brightnessScale  !== "undefined" ? brightnessScale  : "100";
+const intervalSeconds = () => typeof updateInterval   !== "undefined" ? updateInterval   : "0";
+const samplingMode    = () => typeof intervalSampling !== "undefined" ? intervalSampling : "Average";
 
 // -- Configuration ------------------------------------------------------------
 
@@ -114,7 +125,7 @@ const COMBINED_SET_RETRY_MS = 60000;
 
 export function Name()      { return "Tapo"; }
 export function Publisher() { return "SignalRGB Community"; }
-export function Version()   { return "3.1.2"; }
+export function Version()   { return "3.1.3"; }
 export function Type()      { return "network"; }
 
 export function SubdeviceController() { return true; }
@@ -369,8 +380,8 @@ export function Render() {
     }
 
     let r, g, b;
-    const sample = () => LightingMode === "Forced" ? hexToRgb(forcedColor) : averageCanvas();
-    const intervalMs = (parseFloat(updateInterval) || 0) * 1000;
+    const sample = () => lightingMode() === "Forced" ? hexToRgb(forcedColorHex()) : averageCanvas();
+    const intervalMs = (parseFloat(intervalSeconds()) || 0) * 1000;
 
     if (intervalMs > 0) {
         // Every device command starts a fade that the next command cuts short,
@@ -384,7 +395,7 @@ export function Render() {
 
         const now = Date.now();
         if (now - windowStart >= intervalMs) {
-            const target = intervalSampling === "Last Frame"
+            const target = samplingMode() === "Last Frame"
                 ? [r, g, b]
                 : [sumR, sumG, sumB].map((sum) => Math.round(sum / sampleCount));
             sumR = sumG = sumB = sampleCount = 0;
@@ -416,7 +427,7 @@ export function Render() {
     }
 
     const [h, s, v] = rgbToHsv(r, g, b);
-    const scaledBri = Math.round(v * (parseInt(brightnessScale) / 100));
+    const scaledBri = Math.round(v * (parseInt(brightnessPct()) / 100));
     const minDelta  = controller.minDelta;
     const chroma    = Math.max(r, g, b) - Math.min(r, g, b);
     const cct       = trustedCct(r, g, b, v, chroma);
