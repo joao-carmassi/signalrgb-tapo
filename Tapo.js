@@ -1,5 +1,5 @@
 // =============================================================================
-// Tapo — SignalRGB Plugin  v3.1.1
+// Tapo — SignalRGB Plugin  v3.1.2
 // Supports all tapo-rest devices (L5xx, L6xx, L9xx, P1xx)
 // Requires: tapo-rest running locally (https://github.com/ClementNerma/tapo-rest)
 // Transport: XMLHttpRequest
@@ -104,13 +104,17 @@ let glideStep  = 0;
 
 // Whether tapo-rest has the combined `set` action. null until the first
 // attempt; false once the route turns out to be missing (older tapo-rest).
+// A missing route is retried after a while, so upgrading tapo-rest takes
+// effect without restarting SignalRGB.
 let combinedSet = null;
+let combinedSetMissingAt = 0;
+const COMBINED_SET_RETRY_MS = 60000;
 
 // -- Device identity ----------------------------------------------------------
 
 export function Name()      { return "Tapo"; }
 export function Publisher() { return "SignalRGB Community"; }
-export function Version()   { return "3.1.1"; }
+export function Version()   { return "3.1.2"; }
 export function Type()      { return "network"; }
 
 export function SubdeviceController() { return true; }
@@ -555,6 +559,10 @@ function sendColor(hue, saturation, bri, mode, cct) {
     // Color and brightness in one device command. Sent separately, the
     // brightness command lands mid-way through the color fade and cuts it off.
     // Setting brightness also turns the device on, so no /on is needed.
+    if (combinedSet === false && Date.now() - combinedSetMissingAt >= COMBINED_SET_RETRY_MS) {
+        combinedSet = null;
+    }
+
     if (caps.color && combinedSet !== false) {
         httpGet(`/actions/${dt}/set?device=${dn}&brightness=${bri}&${colorParams}`, (status, body) => {
             if (handle401(status)) return;
@@ -562,6 +570,7 @@ function sendColor(hue, saturation, bri, mode, cct) {
             if (status === 404 && !body) {
                 device.log(`[Tapo] [${dn}] tapo-rest has no /set action — using separate commands`);
                 combinedSet = false;
+                combinedSetMissingAt = Date.now();
                 invalidateSentState();
             } else if (!checkFailure("set", status)) {
                 combinedSet = true;
