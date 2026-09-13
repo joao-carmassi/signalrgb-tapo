@@ -1,5 +1,10 @@
 Item {
+	id: root
 	anchors.fill: parent
+
+	// Filled from the tapo-panel controller. The discovery service only takes
+	// method calls from QML; its properties read back as functions.
+	property string statusMessage: ""
 
 	Column {
 		width: 450
@@ -52,7 +57,7 @@ Item {
 							TextField {
 								id: hostField
 								anchors.fill: parent; leftPadding: 10
-								text: discovery.host || "127.0.0.1"
+								placeholderText: "127.0.0.1"
 								color: theme.primarytextcolor
 								font.family: "Poppins"; font.pixelSize: 12; background: Item {}
 							}
@@ -72,7 +77,7 @@ Item {
 							TextField {
 								id: portField
 								anchors.fill: parent; leftPadding: 10
-								text: String(discovery.port || 8000)
+								placeholderText: "8000"
 								color: theme.primarytextcolor
 								font.family: "Poppins"; font.pixelSize: 12; background: Item {}
 								validator: IntValidator { bottom: 1; top: 65535 }
@@ -93,8 +98,7 @@ Item {
 							TextField {
 								id: passwordField
 								anchors.fill: parent; leftPadding: 10
-								text: discovery.password || ""
-								echoMode: TextInput.Password
+																echoMode: TextInput.Password
 								color: theme.primarytextcolor
 								font.family: "Poppins"; font.pixelSize: 12; background: Item {}
 							}
@@ -163,7 +167,7 @@ Item {
 							TextField {
 								id: frameSkipField
 								anchors.fill: parent; leftPadding: 10
-								text: String(discovery.frameSkip || 6)
+								placeholderText: "6"
 								color: theme.primarytextcolor
 								font.family: "Poppins"; font.pixelSize: 12; background: Item {}
 								validator: IntValidator { bottom: 1; top: 30 }
@@ -189,7 +193,7 @@ Item {
 							TextField {
 								id: minDeltaField
 								anchors.fill: parent; leftPadding: 10
-								text: String(discovery.minDelta !== undefined ? discovery.minDelta : 3)
+								placeholderText: "3"
 								color: theme.primarytextcolor
 								font.family: "Poppins"; font.pixelSize: 12; background: Item {}
 								validator: IntValidator { bottom: 0; top: 100 }
@@ -280,15 +284,9 @@ Item {
 			width: 450
 			height: 18
 			x: 2
-			text: discovery.status || ""
+			text: root.statusMessage
 			color: "#888"; font.family: "Poppins"; font.pixelSize: 11
 			elide: Text.ElideRight
-
-			// The discovery object is plain JS and does not notify QML of changes.
-			Timer {
-				interval: 1000; running: true; repeat: true
-				onTriggered: statusText.text = discovery.status || ""
-			}
 		}
 
 		// ── Discovered devices ────────────────────────────────────────────
@@ -308,10 +306,29 @@ Item {
 
 			delegate: Item {
 				width: 450
-				height: 90
+				height: dev.isPanel ? 0 : 90
+				visible: !dev.isPanel
 				property var dev: model.modelData.obj
 
+				// The panel entry carries settings and status, not a device.
+				Binding {
+					target: root; property: "statusMessage"
+					value: dev.status || ""
+					when: dev.isPanel === true
+				}
+				Component.onCompleted: {
+					if (dev.isPanel !== true) return;
+					// Fill empty fields with the saved settings. An empty field
+					// still means "keep the saved value" when applied.
+					if (hostField.text === "")      hostField.text      = dev.host;
+					if (portField.text === "")      portField.text      = dev.port;
+					if (passwordField.text === "")  passwordField.text  = dev.password;
+					if (frameSkipField.text === "") frameSkipField.text = dev.frameSkip;
+					if (minDeltaField.text === "")  minDeltaField.text  = dev.minDelta;
+				}
+
 				Rectangle {
+					visible: !dev.isPanel
 					width: parent.width
 					height: parent.height - 10
 					radius: 5
@@ -336,7 +353,7 @@ Item {
 							anchors.verticalCenter: parent.verticalCenter
 							Text {
 								id: typeLabel
-								text: dev.deviceType.toUpperCase()
+								text: (dev.deviceType || "").toUpperCase()
 								color: "#29b6a8"; font.family: "Poppins"; font.bold: true
 								font.pixelSize: 10; font.letterSpacing: 0.5; anchors.centerIn: parent
 							}

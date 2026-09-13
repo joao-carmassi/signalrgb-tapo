@@ -206,7 +206,21 @@ export function DiscoveryService() {
     let lastAttempt   = -Infinity;
     let attempt       = 0;           // id of the discovery attempt in flight
     let replaceOnSync = false;       // drop cached devices tapo-rest no longer lists
-    disc.status = "Waiting for tapo-rest...";
+
+    // The QML panel can call methods on the discovery service but cannot read
+    // its properties; a controller object is the only data it can see. This
+    // one is never announced, so it shows up in the panel but not as a device.
+    const panel = new TapoPanel();
+
+    function updatePanel(status) {
+        if (status !== undefined) panel.status = status;
+        panel.host      = host;
+        panel.port      = String(port);
+        panel.password  = password;
+        panel.frameSkip = String(FRAME_SKIP);
+        panel.minDelta  = String(MIN_DELTA);
+        if (service.getController(panel.id) !== undefined) service.updateController(panel);
+    }
 
     // Called once when SignalRGB loads the plugin.
     this.Initialize = function() {
@@ -222,12 +236,7 @@ export function DiscoveryService() {
         if (savedFrameSkip) FRAME_SKIP = parseInt(savedFrameSkip);
         if (savedMinDelta !== undefined && savedMinDelta !== "") MIN_DELTA = parseInt(savedMinDelta);
 
-        disc.host      = host;
-        disc.port      = port;
-        disc.password  = password;
-        disc.frameSkip = FRAME_SKIP;
-        disc.minDelta  = MIN_DELTA;
-
+        updatePanel("Waiting for tapo-rest...");
         service.log("[Tapo] tapo-rest @ " + host + ":" + port);
     };
 
@@ -238,6 +247,7 @@ export function DiscoveryService() {
         // official network plugins do with their device caches.
         if (!cacheLoaded) {
             cacheLoaded = true;
+            service.addController(panel);
             loadCachedDevices();
         }
 
@@ -247,7 +257,7 @@ export function DiscoveryService() {
 
         for (const cont of service.controllers) {
             const bridge = cont.obj;
-            if (!bridge.announced) {
+            if (!bridge.isPanel && !bridge.announced) {
                 bridge.announced = true;
                 service.log("[Tapo] Announcing: " + bridge.name);
                 service.announceController(bridge);
@@ -263,6 +273,7 @@ export function DiscoveryService() {
 
     // Called from QML to update and persist the tapo-rest connection config.
     this.setServerConfig = function(newHost, newPort, newPassword) {
+        const oldConfig = host + ":" + port + "/" + password;
         host     = newHost           || host;
         port     = parseInt(newPort) || port;
         password = newPassword       || password;
@@ -271,18 +282,18 @@ export function DiscoveryService() {
         service.saveSetting("tapoRest", "port",     String(port));
         service.saveSetting("tapoRest", "password", password);
 
-        disc.host     = host;
-        disc.port     = port;
-        disc.password = password;
-
-        // Controller ids include host and port, so start over with new config.
-        forgetDevices();
+        // Controller ids include host and port, and devices carry the
+        // password, so a real change starts over. Re-applying the same
+        // settings keeps the devices and only reconnects.
+        if (host + ":" + port + "/" + password !== oldConfig) forgetDevices();
+        updatePanel("Connecting to tapo-rest...");
         startDiscovery(true);
     };
 
     // Called from QML: fetch the device list again and drop devices that
     // tapo-rest no longer lists.
     this.rescan = function() {
+        updatePanel("Scanning...");
         startDiscovery(true);
     };
 
@@ -291,7 +302,7 @@ export function DiscoveryService() {
     this.forget = function() {
         forgetDevices();
         autoDiscover = false;
-        disc.status = "Devices forgotten. Rescan to find them again.";
+        updatePanel("Devices forgotten. Rescan to find them again.");
     };
 
     // Called from QML to update and persist the render tuning config.
@@ -304,15 +315,18 @@ export function DiscoveryService() {
         service.saveSetting("tapoRender", "frameSkip", String(FRAME_SKIP));
         service.saveSetting("tapoRender", "minDelta",  String(MIN_DELTA));
 
-        disc.frameSkip = FRAME_SKIP;
-        disc.minDelta  = MIN_DELTA;
-
         // Propagate live to all existing device instances.
-        for (const cont of service.controllers) {
-            cont.obj.frameSkip = FRAME_SKIP;
-            cont.obj.minDelta  = MIN_DELTA;
+        for (const bridge of deviceControllers()) {
+            bridge.frameSkip = FRAME_SKIP;
+            bridge.minDelta  = MIN_DELTA;
         }
+        updatePanel();
     };
+
+    // Device controllers, without the panel.
+    function deviceControllers() {
+        return service.controllers.map((cont) => cont.obj).filter((obj) => !obj.isPanel);
+    }
 
     function controllerValue(dev) {
         return {
@@ -339,7 +353,7 @@ export function DiscoveryService() {
         }
         service.log("[Tapo] Restoring " + devices.length + " cached device(s)");
         for (const dev of devices) disc.Discovered(controllerValue(dev));
-        if (devices.length > 0) disc.status = "Restored " + devices.length + " device(s). Waiting for tapo-rest...";
+        if (devices.length > 0) updatePanel("Restored " + devices.length + " device(s). Waiting for tapo-rest...");
     }
 
     function saveCachedDevices(devices) {
@@ -347,13 +361,20 @@ export function DiscoveryService() {
         service.saveSetting("tapoDevices", "list", JSON.stringify(list));
     }
 
-    function removeController(bridge) {
-        service.suppressController(bridge);
-        service.removeController(bridge);
+    // SignalRGB crashed removing devices by their controller object. The
+    // official Philips Hue plugin passes the list entry instead; do the same.
+    function removeController(id) {
+        for (const cont of service.controllers) {
+            if (cont.obj.id === id) {
+                service.suppressController(cont);
+                service.removeController(cont);
+                return;
+            }
+        }
     }
 
     function forgetDevices() {
-        for (const cont of [...service.controllers]) removeController(cont.obj);
+        for (const bridge of deviceControllers()) removeController(bridge.id);
         service.saveSetting("tapoDevices", "list", "[]");
         attempt++;   // abandon any discovery in flight
         discovering   = false;
@@ -376,9 +397,9 @@ export function DiscoveryService() {
 
     function discoveryFailed(what, status, body) {
         discovering = false;
-        disc.status = status === 0
+        updatePanel(status === 0
             ? "tapo-rest is not running at " + host + ":" + port + ". Retrying..."
-            : what + " failed (HTTP " + status + "). Retrying...";
+            : what + " failed (HTTP " + status + "). Retrying...");
         service.log("[Tapo] " + what + " failed — HTTP " + status + (body ? " — " + body : ""));
     }
 
@@ -421,10 +442,10 @@ export function DiscoveryService() {
             const values = devices.map(controllerValue);
             if (replaceOnSync) {
                 const ids = new Set(values.map((value) => value.id));
-                for (const cont of [...service.controllers]) {
-                    if (!ids.has(cont.obj.id)) {
-                        service.log("[Tapo] Removing " + cont.obj.name + ", no longer in tapo-rest");
-                        removeController(cont.obj);
+                for (const bridge of deviceControllers()) {
+                    if (!ids.has(bridge.id)) {
+                        service.log("[Tapo] Removing " + bridge.name + ", no longer in tapo-rest");
+                        removeController(bridge.id);
                     }
                 }
             }
@@ -434,9 +455,24 @@ export function DiscoveryService() {
             discovering   = false;
             discovered    = true;
             replaceOnSync = false;
-            disc.status   = "Connected. " + devices.length + " device(s).";
+            updatePanel("Connected. " + devices.length + " device(s).");
         };
         xhr.send();
+    }
+}
+
+// Connection settings and status for the service panel. Never announced.
+class TapoPanel {
+    constructor() {
+        this.id        = "tapo-panel";
+        this.isPanel   = true;
+        this.name      = "tapo-rest";
+        this.status    = "";
+        this.host      = HOST;
+        this.port      = String(PORT);
+        this.password  = PASSWORD;
+        this.frameSkip = String(FRAME_SKIP);
+        this.minDelta  = String(MIN_DELTA);
     }
 }
 
