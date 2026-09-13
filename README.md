@@ -60,6 +60,15 @@ All settings are saved persistently and survive plugin reloads.
 
 Hit **Apply** to save and immediately reconnect. Devices will be re-discovered automatically.
 
+### Devices (service panel)
+
+The discovered device list is cached, so tapo-rest does not need to be running when SignalRGB starts. Cached devices are restored at startup, the service retries tapo-rest every 10 seconds, and each device connects and starts syncing as soon as it answers. If tapo-rest is stopped later, devices wait and reconnect the same way.
+
+| Button | Description |
+|---|---|
+| Rescan | Fetch the device list again. Devices no longer in tapo-rest are removed. |
+| Forget | Remove all devices and clear the cache. Automatic discovery stays off until Rescan or Apply. |
+
 ### Rendering (service panel)
 
 | Field | Default | Description |

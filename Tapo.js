@@ -1,5 +1,5 @@
 // =============================================================================
-// Tapo — SignalRGB Plugin  v3.2.0
+// Tapo — SignalRGB Plugin  v3.3.0
 // Supports all tapo-rest devices (L5xx, L6xx, L9xx, P1xx)
 // Requires: tapo-rest running locally (https://github.com/ClementNerma/tapo-rest)
 // Transport: XMLHttpRequest
@@ -149,11 +149,16 @@ let combinedSet = null;
 let combinedSetMissingAt = 0;
 const COMBINED_SET_RETRY_MS = 60000;
 
+// How often a device retries logging in while tapo-rest is unreachable.
+const LOGIN_RETRY_MS = 5000;
+let lastLoginAttempt = -Infinity;
+let lastLoginFailure = null;   // status of the last failed login, to log it once
+
 // -- Device identity ----------------------------------------------------------
 
 export function Name()      { return "Tapo"; }
 export function Publisher() { return "SignalRGB Community"; }
-export function Version()   { return "3.2.0"; }
+export function Version()   { return "3.3.0"; }
 export function Type()      { return "network"; }
 
 export function SubdeviceController() { return true; }
@@ -181,6 +186,11 @@ function deviceCaps(type) {
 
 // -- Discovery service --------------------------------------------------------
 
+// tapo-rest is often started after SignalRGB, or not at all. The device list is
+// cached so the devices come back at startup without it, and discovery keeps
+// retrying on this interval until it answers once.
+const DISCOVERY_RETRY_MS = 10000;
+
 export function DiscoveryService() {
     const disc = this;
     let discoveryToken = null;
@@ -188,6 +198,15 @@ export function DiscoveryService() {
     let host     = HOST;
     let port     = PORT;
     let password = PASSWORD;
+
+    let cacheLoaded   = false;
+    let discovering   = false;
+    let discovered    = false;       // the device list was fetched this session
+    let autoDiscover  = true;        // off after Forget, until Rescan or Apply
+    let lastAttempt   = -Infinity;
+    let attempt       = 0;           // id of the discovery attempt in flight
+    let replaceOnSync = false;       // drop cached devices tapo-rest no longer lists
+    disc.status = "Waiting for tapo-rest...";
 
     // Called once when SignalRGB loads the plugin.
     this.Initialize = function() {
@@ -209,12 +228,23 @@ export function DiscoveryService() {
         disc.frameSkip = FRAME_SKIP;
         disc.minDelta  = MIN_DELTA;
 
-        service.log("[Tapo] Connecting to tapo-rest @ " + host + ":" + port);
-        serviceLogin();
+        service.log("[Tapo] tapo-rest @ " + host + ":" + port);
     };
 
-    // Called periodically by SignalRGB — announce any pending controllers.
+    // Called periodically by SignalRGB — restore cached devices, retry
+    // discovery while tapo-rest is down, and announce any pending controllers.
     this.Update = function() {
+        // Controllers are added here rather than in Initialize, as the
+        // official network plugins do with their device caches.
+        if (!cacheLoaded) {
+            cacheLoaded = true;
+            loadCachedDevices();
+        }
+
+        if (autoDiscover && !discovered && !discovering && Date.now() - lastAttempt >= DISCOVERY_RETRY_MS) {
+            startDiscovery(false);
+        }
+
         for (const cont of service.controllers) {
             const bridge = cont.obj;
             if (!bridge.announced) {
@@ -245,12 +275,23 @@ export function DiscoveryService() {
         disc.port     = port;
         disc.password = password;
 
-        // Remove existing controllers and rediscover with new config.
-        for (const cont of service.controllers) {
-            service.removeController(cont);
-        }
-        discoveryToken = null;
-        serviceLogin();
+        // Controller ids include host and port, so start over with new config.
+        forgetDevices();
+        startDiscovery(true);
+    };
+
+    // Called from QML: fetch the device list again and drop devices that
+    // tapo-rest no longer lists.
+    this.rescan = function() {
+        startDiscovery(true);
+    };
+
+    // Called from QML: remove every device and the cache. Automatic discovery
+    // stays off until Rescan or Apply, or the devices would come straight back.
+    this.forget = function() {
+        forgetDevices();
+        autoDiscover = false;
+        disc.status = "Devices forgotten. Rescan to find them again.";
     };
 
     // Called from QML to update and persist the render tuning config.
@@ -273,53 +314,127 @@ export function DiscoveryService() {
         }
     };
 
-    function serviceLogin() {
-        service.log("[Tapo] POST /login ...");
+    function controllerValue(dev) {
+        return {
+            id:         host + ":" + port + "/" + dev.name,
+            name:       "Tapo " + dev.device_type.toUpperCase() + " – " + dev.name,
+            ip:         host,
+            port:       port,
+            password:   password,
+            deviceName: dev.name,
+            deviceType: dev.device_type.toLowerCase(),
+            frameSkip:  FRAME_SKIP,
+            minDelta:   MIN_DELTA,
+        };
+    }
+
+    // Only names and types are cached; host, port and password come from the
+    // connection settings, so changing those never leaves a stale copy behind.
+    function loadCachedDevices() {
+        let devices = [];
+        try {
+            devices = JSON.parse(service.getSetting("tapoDevices", "list") || "[]");
+        } catch (e) {
+            service.log("[Tapo] Device cache is unreadable, ignoring it");
+        }
+        service.log("[Tapo] Restoring " + devices.length + " cached device(s)");
+        for (const dev of devices) disc.Discovered(controllerValue(dev));
+        if (devices.length > 0) disc.status = "Restored " + devices.length + " device(s). Waiting for tapo-rest...";
+    }
+
+    function saveCachedDevices(devices) {
+        const list = devices.map((dev) => ({ name: dev.name, device_type: dev.device_type }));
+        service.saveSetting("tapoDevices", "list", JSON.stringify(list));
+    }
+
+    function removeController(bridge) {
+        service.suppressController(bridge);
+        service.removeController(bridge);
+    }
+
+    function forgetDevices() {
+        for (const cont of [...service.controllers]) removeController(cont.obj);
+        service.saveSetting("tapoDevices", "list", "[]");
+        attempt++;   // abandon any discovery in flight
+        discovering   = false;
+        discovered    = false;
+        replaceOnSync = false;
+    }
+
+    // A new attempt supersedes any still in flight, which may be talking to a
+    // host that Apply has since replaced. A requested replace stays pending
+    // until an attempt succeeds, so a Rescan while tapo-rest is down still
+    // prunes once it comes up.
+    function startDiscovery(replace) {
+        autoDiscover  = true;
+        replaceOnSync = replaceOnSync || replace;
+        discovered    = false;   // keep retrying until this attempt succeeds
+        discovering   = true;
+        lastAttempt   = Date.now();
+        serviceLogin(++attempt);
+    }
+
+    function discoveryFailed(what, status, body) {
+        discovering = false;
+        disc.status = status === 0
+            ? "tapo-rest is not running at " + host + ":" + port + ". Retrying..."
+            : what + " failed (HTTP " + status + "). Retrying...";
+        service.log("[Tapo] " + what + " failed — HTTP " + status + (body ? " — " + body : ""));
+    }
+
+    function serviceLogin(id) {
         const xhr = new XMLHttpRequest();
         xhr.open("POST", `http://${host}:${port}/login`, true);
         xhr.setRequestHeader("Content-Type", "application/json");
         xhr.onreadystatechange = function() {
-            if (xhr.readyState !== 4) return;
-            service.log("[Tapo] /login → HTTP " + xhr.status);
+            if (xhr.readyState !== 4 || id !== attempt) return;
             if (xhr.status === 200) {
                 discoveryToken = xhr.responseText.trim().replace(/^"|"$/g, "");
-                service.log("[Tapo] Discovery token acquired");
-                fetchDevices();
+                fetchDevices(id);
             } else {
-                service.log("[Tapo] Discovery login failed — body: " + xhr.responseText);
+                discoveryFailed("Login", xhr.status, xhr.responseText);
             }
         };
         xhr.send(JSON.stringify({ password: password }));
     }
 
-    function fetchDevices() {
-        service.log("[Tapo] GET /devices ...");
+    function fetchDevices(id) {
         const xhr = new XMLHttpRequest();
         xhr.open("GET", `http://${host}:${port}/devices`, true);
         xhr.setRequestHeader("Authorization", "Bearer " + discoveryToken);
         xhr.onreadystatechange = function() {
-            if (xhr.readyState !== 4) return;
-            service.log("[Tapo] /devices → HTTP " + xhr.status + " — " + xhr.responseText);
-            if (xhr.status === 200) {
-                const devices = JSON.parse(xhr.responseText);
-                service.log("[Tapo] Found " + devices.length + " device(s)");
-                for (const dev of devices) {
-                    service.log("[Tapo] Device: " + JSON.stringify(dev));
-                    disc.Discovered({
-                        id:         host + ":" + port + "/" + dev.name,
-                        name:       "Tapo " + dev.device_type.toUpperCase() + " – " + dev.name,
-                        ip:         host,
-                        port:       port,
-                        password:   password,
-                        deviceName: dev.name,
-                        deviceType: dev.device_type.toLowerCase(),
-                        frameSkip:  FRAME_SKIP,
-                        minDelta:   MIN_DELTA,
-                    });
-                }
-            } else {
-                service.log("[Tapo] Failed to fetch devices — body: " + xhr.responseText);
+            if (xhr.readyState !== 4 || id !== attempt) return;
+            if (xhr.status !== 200) {
+                discoveryFailed("Device list", xhr.status, xhr.responseText);
+                return;
             }
+
+            let devices;
+            try {
+                devices = JSON.parse(xhr.responseText);
+            } catch (e) {
+                discoveryFailed("Device list", xhr.status, "unreadable response");
+                return;
+            }
+            service.log("[Tapo] Found " + devices.length + " device(s): " + devices.map((dev) => dev.name).join(", "));
+
+            const values = devices.map(controllerValue);
+            if (replaceOnSync) {
+                const ids = new Set(values.map((value) => value.id));
+                for (const cont of [...service.controllers]) {
+                    if (!ids.has(cont.obj.id)) {
+                        service.log("[Tapo] Removing " + cont.obj.name + ", no longer in tapo-rest");
+                        removeController(cont.obj);
+                    }
+                }
+            }
+            for (const value of values) disc.Discovered(value);
+
+            saveCachedDevices(devices);
+            discovering   = false;
+            discovered    = true;
+            replaceOnSync = false;
+            disc.status   = "Connected. " + devices.length + " device(s).";
         };
         xhr.send();
     }
@@ -557,21 +672,36 @@ function httpGet(path, callback) {
 
 // -- Auth & color commands ----------------------------------------------------
 
+// Render calls login every frame while there is no session, which with
+// tapo-rest not running would be a refused connection 30 times a second.
 function login() {
-    if (requestPending) return;
-    requestPending = true;
+    if (requestPending || Date.now() - lastLoginAttempt < LOGIN_RETRY_MS) return;
+    requestPending   = true;
+    lastLoginAttempt = Date.now();
 
-    device.log(`[Tapo] [${controller.deviceName}] POST /login ...`);
     httpPost("/login", { password: controller.password }, (status, body) => {
         requestPending = false;
-        device.log(`[Tapo] [${controller.deviceName}] /login → HTTP ${status}`);
         if (status === 200) {
             sessionToken = body.trim().replace(/^"|"$/g, "");
-            device.log(`[Tapo] [${controller.deviceName}] Session token acquired`);
-        } else {
-            device.log(`[Tapo] [${controller.deviceName}] Login failed — body: ${body}`);
+            lastLoginFailure = null;
+            device.log(`[Tapo] [${controller.deviceName}] Connected to tapo-rest`);
+        } else if (status !== lastLoginFailure) {
+            // Logged once per kind of failure, not on every retry.
+            lastLoginFailure = status;
+            device.log(status === 0
+                ? `[Tapo] [${controller.deviceName}] tapo-rest is not reachable, retrying every ${LOGIN_RETRY_MS / 1000} s`
+                : `[Tapo] [${controller.deviceName}] Login failed — HTTP ${status} — ${body}`);
         }
     });
+}
+
+// The session is gone (tapo-rest restarted, or stopped). Log in again, and
+// forget what was sent, so the scene is resent in full once it is back.
+function connectionLost() {
+    sessionToken   = null;
+    requestPending = false;
+    glideFrom = glideTo = glideSent = null;
+    invalidateSentState();
 }
 
 function sendColor(hue, saturation, bri, mode, cct) {
@@ -581,18 +711,21 @@ function sendColor(hue, saturation, bri, mode, cct) {
 
     device.log(`[Tapo] [${dn}] sendColor mode=${mode} h=${hue} s=${saturation} v=${bri} cct=${cct} (color=${caps.color} dim=${caps.dim})`);
 
-    // Turn off when brightness hits zero
-    if (bri === 0) {
-        requestPending = true;
-        httpGet(`/actions/${dt}/off?device=${dn}`, () => { requestPending = false; });
-        return;
+    // 401: the token expired or tapo-rest restarted. 0: tapo-rest is down.
+    function handle401(status) {
+        if (status === 401 || status === 0) { connectionLost(); return true; }
+        return false;
     }
 
     requestPending = true;
 
-    function handle401(status) {
-        if (status === 401) { sessionToken = null; requestPending = false; return true; }
-        return false;
+    // Turn off when brightness hits zero
+    if (bri === 0) {
+        httpGet(`/actions/${dt}/off?device=${dn}`, (status) => {
+            if (handle401(status)) return;
+            requestPending = false;
+        });
+        return;
     }
 
     // Any non-2xx means the bulb kept its previous color — clear the cached
@@ -648,16 +781,16 @@ function sendColor(hue, saturation, bri, mode, cct) {
                 if (handle401(s2)) return;
                 checkFailure(mode === "cct" ? "set-color-temperature" : "set-hue-saturation", s2);
                 httpGet(`/actions/${dt}/set-brightness?device=${dn}&level=${bri}`, (s3) => {
-                    if (s3 === 401) sessionToken = null;
-                    else checkFailure("set-brightness", s3);
+                    if (handle401(s3)) return;
+                    checkFailure("set-brightness", s3);
                     requestPending = false;
                 });
             });
         } else if (caps.dim) {
             // Dimmable only: set brightness
             httpGet(`/actions/${dt}/set-brightness?device=${dn}&level=${bri}`, (s2) => {
-                if (s2 === 401) sessionToken = null;
-                else checkFailure("set-brightness", s2);
+                if (handle401(s2)) return;
+                checkFailure("set-brightness", s2);
                 requestPending = false;
             });
         } else {

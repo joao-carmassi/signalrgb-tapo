@@ -230,14 +230,64 @@ Item {
 
 			Text {
 				id: sectionLabel
-				text: "DISCOVERED DEVICES"
+				text: "DEVICES"
 				color: "#555"; font.family: "Poppins"; font.pixelSize: 10; font.letterSpacing: 1.5
 				anchors.verticalCenter: parent.verticalCenter; x: 2
 			}
 			Rectangle {
 				height: 1; color: "#333"
 				anchors.left: sectionLabel.right; anchors.leftMargin: 10
+				anchors.right: deviceButtons.left; anchors.rightMargin: 10
+				anchors.verticalCenter: parent.verticalCenter
+			}
+			Row {
+				id: deviceButtons
+				spacing: 6
 				anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+
+				Rectangle {
+					width: 66; height: 24; radius: 4
+					color: rescanMouse.containsMouse ? "#2fd0c0" : "#1f8c81"
+					Text {
+						anchors.centerIn: parent; text: "Rescan"
+						color: "white"; font.family: "Poppins"; font.bold: true; font.pixelSize: 11
+					}
+					MouseArea {
+						id: rescanMouse; anchors.fill: parent
+						hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+						onClicked: discovery.rescan()
+					}
+				}
+				Rectangle {
+					width: 66; height: 24; radius: 4
+					color: forgetMouse.containsMouse ? "#c45a5a" : "#8c3f3f"
+					Text {
+						anchors.centerIn: parent; text: "Forget"
+						color: "white"; font.family: "Poppins"; font.bold: true; font.pixelSize: 11
+					}
+					MouseArea {
+						id: forgetMouse; anchors.fill: parent
+						hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+						onClicked: discovery.forget()
+					}
+				}
+			}
+		}
+
+		// ── Connection status ─────────────────────────────────────────────
+		Text {
+			id: statusText
+			width: 450
+			height: 18
+			x: 2
+			text: discovery.status || ""
+			color: "#888"; font.family: "Poppins"; font.pixelSize: 11
+			elide: Text.ElideRight
+
+			// The discovery object is plain JS and does not notify QML of changes.
+			Timer {
+				interval: 1000; running: true; repeat: true
+				onTriggered: statusText.text = discovery.status || ""
 			}
 		}
 
@@ -246,7 +296,7 @@ Item {
 			id: controllerList
 			model: service.controllers
 			width: 450
-			height: parent.height - 158 - 118 - 30 - 24 // cards + header + spacing
+			height: parent.height - 158 - 118 - 30 - 18 - 32 // cards + header + status + spacing
 			clip: true
 
 			ScrollBar.vertical: ScrollBar {
