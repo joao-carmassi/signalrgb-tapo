@@ -1,5 +1,5 @@
 // =============================================================================
-// Tapo — SignalRGB Plugin  v3.6.0
+// Tapo — SignalRGB Plugin  v3.6.1
 // Supports all tapo-rest devices (L5xx, L6xx, L9xx, P1xx)
 // Requires: tapo-rest running locally (https://github.com/ClementNerma/tapo-rest)
 // Transport: XMLHttpRequest
@@ -21,7 +21,7 @@ intervalSampling:readonly
 const lightingMode    = () => typeof LightingMode     !== "undefined" ? LightingMode     : "Canvas";
 const forcedColorHex  = () => typeof forcedColor      !== "undefined" ? forcedColor      : "0099ff";
 const brightnessPct   = () => typeof brightnessScale  !== "undefined" ? brightnessScale  : "100";
-const intervalSeconds = () => typeof updateInterval   !== "undefined" ? updateInterval   : "1.5";
+const intervalSeconds = () => typeof updateInterval   !== "undefined" ? updateInterval   : "1";
 const samplingMode    = () => typeof intervalSampling !== "undefined" ? intervalSampling : "Average";
 
 // -- Configuration ------------------------------------------------------------
@@ -132,7 +132,7 @@ let lastLoginFailure = null;   // status of the last failed login, to log it onc
 
 export function Name()      { return "Tapo"; }
 export function Publisher() { return "SignalRGB Community"; }
-export function Version()   { return "3.6.0"; }
+export function Version()   { return "3.6.1"; }
 export function Type()      { return "network"; }
 
 export function SubdeviceController() { return true; }
@@ -502,8 +502,8 @@ export function ControllableParameters() {
             type:     "number",
             min:      "0",
             max:      "30",
-            step:     "0.5",
-            default:  "1.5"
+            step:     "1",
+            default:  "1"
         },
         {
             property: "intervalSampling",
