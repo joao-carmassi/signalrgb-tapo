@@ -40,27 +40,31 @@ let MIN_DELTA   = 3;
 // temperature instead of hue/saturation. The Tapo API rejects saturation=0
 // outright, and saturations of 1-10 render as tinted pastels rather than white.
 //
-// The test is absolute chroma (max channel - min channel, 0-255), NOT HSV
-// saturation. Saturation is a ratio, so on a dark screen a one-unit channel
-// imbalance reads as a large saturation with an essentially random hue:
-// (10,10,11) is visually black but scores saturation 9, hue 240. Absolute
-// chroma is scale-invariant and stays small when the scene really is neutral.
+// The test is the distance from the nearest blackbody white the bulb can show
+// (CCT_MIN-CCT_MAX), not from neutral gray. The bulb fades within a mode but
+// snaps when it switches between color and white, so warm whites and yellows
+// that the white mode can show must stay in it: measured from neutral, cream
+// (255,220,180) and warm yellow (255,200,150) left white mode, and every change
+// between them and white snapped. On this scale they score 6 and 2.
+//
+// The distance is colorDistance's, normalised by the color's peak with a floor,
+// so it does not change as a color dims (a pulsing warm white stays white), yet
+// near-black noise stays small: (10,10,11) scores 5, dim purple (20,12,22) 36.
 //
 // The two thresholds form a hysteresis band. A scene parked on a single
 // boundary would otherwise flip modes on sensor noise alone, and a mode flip
-// bypasses the whole delta gate.
-const CHROMA_ENTER_COLOR = 24;   // rise above this to leave white mode
-const CHROMA_STAY_COLOR  = 16;   // fall below this to return to white mode
+// bypasses the whole delta gate. Pink (255,200,200) scores 21, golden yellow
+// (255,191,96) 18.
+const TINT_ENTER_COLOR = 20;   // rise above this to leave white mode
+const TINT_STAY_COLOR  = 12;   // fall below this to return to white mode
 
-// Absolute chroma alone misreads dim colors: a purple pulse fading to
-// (20,12,22) has a chroma of 10 and would be sent as white, so music that
-// pulses between a color and darkness flashed white in between. A dim scene
-// still counts as color when its saturation is high AND its chroma is clear of
-// the one-or-two-unit noise that makes (10,10,11) score saturation 9.
-const DIM_SAT_ENTER_COLOR    = 40;
-const DIM_SAT_STAY_COLOR     = 30;
-const DIM_CHROMA_ENTER_COLOR = 8;
-const DIM_CHROMA_STAY_COLOR  = 5;
+// A mode change has to be wanted this long before it is made, so a white flash
+// in a colored scene (or the reverse) does not cost two snaps. Realtime only;
+// a timed glide switches on its last step instead.
+const MODE_HOLD_MS = 1000;
+let modeWantedSince = null;
+
+const DIM_SAT_STAY_COLOR = 30;
 
 // Below this value (HSV V, 0-100) hue carries no usable signal. A color fading
 // out keeps the hue and saturation it had, so a fade to black does not pass
@@ -619,19 +623,27 @@ export function Render() {
     const chroma    = Math.max(r, g, b) - Math.min(r, g, b);
     const cct       = trustedCct(r, g, b, v, chroma);
 
-    // Pick the bulb mode from chroma (or, for dim scenes, saturation backed by
-    // enough chroma to rule out noise), with hysteresis around the boundary
-    // and a floor for very dark scenes.
-    const isColor = (chromaMin, satMin, dimChromaMin) =>
-        chroma > chromaMin || (s >= satMin && chroma >= dimChromaMin);
+    // Pick the bulb mode from the distance to the blackbody whites, with
+    // hysteresis around the boundary and a floor for very dark scenes.
     let mode;
     if (v < DARK_V_FLOOR) {
         const fadingColor = lastMode === "hs" && s >= DIM_SAT_STAY_COLOR && chroma >= DARK_CHROMA_STAY_COLOR;
         mode = fadingColor ? "hs" : "cct";
         if (fadingColor) { h = lastHue; s = lastSat; }
     }
-    else if (lastMode === "hs") mode = isColor(CHROMA_STAY_COLOR,  DIM_SAT_STAY_COLOR,  DIM_CHROMA_STAY_COLOR)  ? "hs" : "cct";
-    else                        mode = isColor(CHROMA_ENTER_COLOR, DIM_SAT_ENTER_COLOR, DIM_CHROMA_ENTER_COLOR) ? "hs" : "cct";
+    else mode = whiteTint([r, g, b]) > (lastMode === "hs" ? TINT_STAY_COLOR : TINT_ENTER_COLOR) ? "hs" : "cct";
+
+    // Hold back a mode change, sending this color in the current mode, until
+    // it has been wanted for MODE_HOLD_MS or a glide reaches its last step.
+    // While the bulb is off a change costs nothing, so it is made at once.
+    if (mode === lastMode || lastMode === null) modeWantedSince = null;
+    else if (modeWantedSince === null) modeWantedSince = Date.now();
+    if (modeWantedSince !== null && scaledBri > 0 && lastBri > 0) {
+        const hold = intervalMs > 0
+            ? glideStep < glideSteps
+            : Date.now() - modeWantedSince < MODE_HOLD_MS;
+        if (hold) mode = lastMode;
+    }
 
     // Gate on whatever this mode actually transmits. In white mode that is the
     // Kelvin value, which no combination of hue, saturation and brightness
@@ -882,6 +894,28 @@ function averageCanvas() {
         Math.round(rSum / count),
         Math.round(gSum / count),
         Math.round(bSum / count)
+    ];
+}
+
+// Distance from a color to the nearest blackbody white in CCT_MIN-CCT_MAX,
+// scaled to the color's brightness, on colorDistance's scale.
+function whiteTint(rgb) {
+    const peak = Math.max(...rgb);
+    let best = Infinity;
+    for (let k = CCT_MIN; k <= CCT_MAX; k += 100) {
+        const white = kelvinToRgb(k).map((c) => c * peak / 255);
+        best = Math.min(best, colorDistance(rgb, white));
+    }
+    return best;
+}
+
+// Blackbody color in sRGB (Tanner Helland's fit; this form holds for 2000-6600K).
+function kelvinToRgb(k) {
+    const t = k / 100;
+    return [
+        255,
+        99.4708025861 * Math.log(t) - 161.1195681661,
+        138.5177312231 * Math.log(t - 10) - 305.0447927307,
     ];
 }
 
