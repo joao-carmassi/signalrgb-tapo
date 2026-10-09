@@ -1,5 +1,5 @@
 // =============================================================================
-// Tapo — SignalRGB Plugin  v3.4.0
+// Tapo — SignalRGB Plugin  v3.5.0
 // Supports all tapo-rest devices (L5xx, L6xx, L9xx, P1xx)
 // Requires: tapo-rest running locally (https://github.com/ClementNerma/tapo-rest)
 // Transport: XMLHttpRequest
@@ -111,32 +111,17 @@ let lastMode       = null;   // "hs" | "cct" — forces a resend when the mode f
 let windowStart = -Infinity;
 let sumR = 0, sumG = 0, sumB = 0, sampleCount = 0;
 
-// How long the device takes to fade to a new state on its own (~1 s on an
-// L530). A window longer than this would fade and then sit still until the
-// next window, so a sequence of changes reads as change, pause, change. The
-// move to each window's color is instead split into steps this long, each
-// heading for an intermediate color, so one fade runs straight into the next.
-const DEVICE_FADE_MS = 1000;
-
-// The device fades at a limited speed rather than over a fixed time: a large
-// change takes the full ~1 s, a small one (brightness 60 -> 50, hue +20)
-// finishes in a fraction of that and reads as a hitch. Measured on an L530.
-// So in timed mode a window whose color is only a small step from what the
-// device already shows is skipped, and a glide is only split while every
-// step stays large enough to get the full fade.
-//
-// Distances are RGB Euclidean, normalised by the brighter color's peak so a
-// change in a dim scene counts as much as the same relative change in a
-// bright one. On that scale the hitching changes above measure 52-60, while
-// brightness 60 -> 30 (182) and hue 186 -> 260 (148) got the full fade.
-const MIN_VISIBLE_CHANGE = 80;
-const MIN_GLIDE_STEP     = 140;
-
+// The move to each window's color is glided in small steps, so one device fade
+// runs straight into the next instead of change, pause, change.
 let glideFrom  = null;   // [r,g,b] the current glide starts from
 let glideTo    = null;   // [r,g,b] the window color it ends on
 let glideSent  = null;   // [r,g,b] the last step handed to the device
-let glideSteps = 0;
-let glideStep  = 0;
+
+// Timed mode sends at most one step per GLIDE_STEP_MS, each aimed at where
+// the glide is due. The L530 retargets a fade smoothly when commands arrive
+// 0.3 s apart. Calibration knob: raise to 400-500 if Wi-Fi gets worse.
+const GLIDE_STEP_MS = 300;
+let lastSendAt = -Infinity;
 
 // Whether tapo-rest has the combined `set` action. null until the first
 // attempt; false once the route turns out to be missing (older tapo-rest).
@@ -155,7 +140,7 @@ let lastLoginFailure = null;   // status of the last failed login, to log it onc
 
 export function Name()      { return "Tapo"; }
 export function Publisher() { return "SignalRGB Community"; }
-export function Version()   { return "3.4.0"; }
+export function Version()   { return "3.5.0"; }
 export function Type()      { return "network"; }
 
 export function SubdeviceController() { return true; }
@@ -561,7 +546,8 @@ export function Render() {
 
     if (intervalMs > 0) {
         // Every device command starts a fade that the next command cuts short,
-        // so a fast stream reads as hard cuts. Send one color per window.
+        // so a fast stream reads as hard cuts. One target per window, glided
+        // toward in ~GLIDE_STEP_MS steps.
         //   Average    — mean of the window; steady, never lands on the dark gap
         //                between beats, but opposing colors blend together.
         //   Last Frame — the canvas as the window closes; keeps colors vivid,
@@ -577,35 +563,26 @@ export function Render() {
             sumR = sumG = sumB = sampleCount = 0;
             windowStart = now;
 
-            // Glide from wherever the device was last sent, which is short of
-            // the previous window color if its steps were held back. A window
-            // that barely moves is dropped, leaving any glide in progress be.
-            const from = glideSent || target;
-            const dist = colorDistance(from, target);
-            if (glideSent === null || dist >= MIN_VISIBLE_CHANGE || isLit(from) !== isLit(target)) {
-                glideFrom  = from;
-                glideTo    = target;
-                glideSteps = Math.max(1, Math.min(
-                    Math.round(intervalMs / DEVICE_FADE_MS),
-                    Math.floor(dist / MIN_GLIDE_STEP),
-                ));
-                glideStep  = 0;
-            }
+            // Glide from what the device was last sent, so a late or gated
+            // step never jumps.
+            glideFrom = glideSent || target;
+            glideTo   = target;
         }
 
-        const stepDue = windowStart + glideStep * (intervalMs / glideSteps);
-        if (glideTo === null || glideStep >= glideSteps || now < stepDue || requestPending) return;
+        if (glideTo === null || requestPending || now - lastSendAt < GLIDE_STEP_MS) return;
 
-        glideStep++;
-        [r, g, b] = mixColors(glideFrom, glideTo, glideStep / glideSteps);
+        // Time-based, so a late step (weak Wi-Fi) catches up instead of queueing
+        // lag. Aimed one step ahead, where the glide will be as this fade ends, so
+        // the bulb tracks the line and the window's last step lands on its color.
+        const t = Math.min(1, (now - windowStart + GLIDE_STEP_MS) / intervalMs);
+        [r, g, b] = mixColors(glideFrom, glideTo, t);
     } else {
         sumR = sumG = sumB = sampleCount = 0;
         glideFrom = glideTo = glideSent = null;
         frameCounter++;
-        if (frameCounter < controller.frameSkip) return;
+        // A request still in flight at the boundary must not cost a whole extra skip.
+        if (frameCounter < controller.frameSkip || requestPending) return;
         frameCounter = 0;
-
-        if (requestPending) return;
 
         [r, g, b] = sample();
     }
@@ -644,11 +621,13 @@ export function Render() {
     // black is smaller than minDelta would otherwise leave the bulb lit at 1%.
     const powerChanged = (scaledBri === 0) !== (lastBri === 0);
 
+    // A fixed step is a visible stair at 1-10%, so the brightness threshold
+    // scales with brightness (3 at 100%, 1 at 33% and below with Min Delta 3).
     if (
         !powerChanged &&
         mode === lastMode &&
         colorSettled &&
-        Math.abs(scaledBri - lastBri) < minDelta
+        Math.abs(scaledBri - lastBri) < Math.ceil(minDelta * Math.max(scaledBri, lastBri) / 100)
     ) return;
 
     lastHue  = h;
@@ -657,7 +636,7 @@ export function Render() {
     lastCct  = cct;
     lastMode = mode;
     // Only colors actually sent become the next glide's start.
-    if (intervalMs > 0) glideSent = [r, g, b];
+    if (intervalMs > 0) { glideSent = [r, g, b]; lastSendAt = Date.now(); }
 
     sendColor(h, s, scaledBri, mode, cct);
 }
@@ -842,11 +821,6 @@ function sendColor(hue, saturation, bri, mode, cct) {
 function colorDistance(a, b) {
     const peak = Math.max(64, ...a, ...b);
     return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) / peak * 255;
-}
-
-// Whether a color would switch the device on (it rounds to brightness 1+).
-function isLit(c) {
-    return Math.max(...c) >= 2;
 }
 
 // ponytail: RGB blending passes near white between opposite colors (red↔cyan); blend by hue if that detour ever shows.

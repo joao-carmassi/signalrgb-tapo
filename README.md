@@ -30,6 +30,8 @@ Follow the tapo-rest setup guide to:
 - Add your devices by name (e.g. `desk-light`)
 - Start the server (defaults to `127.0.0.1:8000`)
 
+Use a tapo-rest build with the 2 s device timeout (joao-carmassi/tapo-rest `main`), so a Wi-Fi drop costs at most a couple of seconds instead of freezing the light for 30 s.
+
 For color devices the plugin prefers tapo-rest's combined `set` action, which applies color and brightness in one device command so the device's fade is not interrupted halfway. Builds without it fall back automatically to separate `on`, color and brightness commands.
 
 ### 2. SignalRGB
@@ -74,7 +76,7 @@ The discovered device list is cached, so tapo-rest does not need to be running w
 | Field | Default | Description |
 |---|---|---|
 | Frame Skip | `6` | Frames between color sends. `6` ≈ 5 fps at SignalRGB's 30 fps tick. Lower = more responsive, more API calls. |
-| Min Delta | `3` | Minimum change in hue/saturation/brightness (0–100) required to send; color temperature uses a fixed 60 K threshold. `0` sends every frame (after skip). Higher = less chatter. |
+| Min Delta | `3` | Minimum change in hue/saturation/brightness (0–100) required to send; color temperature uses a fixed 60 K threshold. `0` sends every frame (after skip). Higher = less chatter. The brightness threshold scales with brightness (3 at 100%, 1 at about 33% and below). |
 
 ### Per-device (device settings panel)
 
@@ -83,7 +85,7 @@ The discovered device list is cached, so tapo-rest does not need to be running w
 | Lighting Mode | `Canvas` | `Canvas` syncs to screen average; `Forced` uses a fixed color |
 | Forced Color | `#0099ff` | Color used when Lighting Mode is set to Forced |
 | Brightness | `100%` | Scales the brightness output (1–100%) |
-| Update Interval (s) | `0` | Pick one color every N seconds and glide to it in steps about as long as the device's own ~1 s fade, so consecutive changes flow into each other instead of fading and pausing. `0` keeps the Frame Skip behavior. Useful for music effects, where a fast stream of commands keeps cutting the device's own fade short. |
+| Update Interval (s) | `0` | Pick one color per N-second window and glide to it linearly, sending a step about every 0.3 s (none while nothing changes). Slow drifts stay continuous, and a step delayed by weak Wi-Fi jumps to where the glide should be instead of lagging behind. `0` keeps the Frame Skip behavior. |
 | Interval Sampling | `Average` | With an interval set: `Average` sends the mean color of the window (steady, but opposing colors blend); `Last Frame` sends the canvas as the window closes (vivid, but it catches an arbitrary beat). |
 
 ---
@@ -92,7 +94,7 @@ The discovered device list is cached, so tapo-rest does not need to be running w
 
 ```
 canvas / Forced color
-  ▼ every Nth frame, or one color per Update Interval window glided in ~1 s steps
+  ▼ every Nth frame, or one color per Update Interval window glided in ~0.3 s steps
 pick mode: near a blackbody white (2500–6500 K) → color temperature, else hue/saturation (hysteresis)
   ▼
 delta check (Min Delta on H/S/brightness; 60 K on Kelvin)
