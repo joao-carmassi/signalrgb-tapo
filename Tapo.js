@@ -1,5 +1,5 @@
 // =============================================================================
-// Tapo — SignalRGB Plugin  v3.3.0
+// Tapo — SignalRGB Plugin  v3.4.0
 // Supports all tapo-rest devices (L5xx, L6xx, L9xx, P1xx)
 // Requires: tapo-rest running locally (https://github.com/ClementNerma/tapo-rest)
 // Transport: XMLHttpRequest
@@ -36,33 +36,25 @@ let FRAME_SKIP  = 6;
 // Minimum HSV delta (0–100) before sending a new command
 let MIN_DELTA   = 3;
 
-// Colors this close to neutral are treated as white and sent as a color
-// temperature instead of hue/saturation. The Tapo API rejects saturation=0
-// outright, and saturations of 1-10 render as tinted pastels rather than white.
+// White colors are sent as a color temperature instead of hue/saturation: white
+// mode gives a real white, while the Tapo API rejects saturation=0 outright and
+// saturations of 1-10 render as tinted pastels.
 //
 // The test is the distance from the nearest blackbody white the bulb can show
-// (CCT_MIN-CCT_MAX), not from neutral gray. The bulb fades within a mode but
-// snaps when it switches between color and white, so warm whites and yellows
-// that the white mode can show must stay in it: measured from neutral, cream
-// (255,220,180) and warm yellow (255,200,150) left white mode, and every change
-// between them and white snapped. On this scale they score 6 and 2.
+// (CCT_MIN-CCT_MAX), not from neutral gray, so creams and warm yellows, which
+// white mode renders correctly, use it too. On this scale cream (255,220,180)
+// scores 6 and warm yellow (255,200,150) scores 2.
 //
 // The distance is colorDistance's, normalised by the color's peak with a floor,
 // so it does not change as a color dims (a pulsing warm white stays white), yet
 // near-black noise stays small: (10,10,11) scores 5, dim purple (20,12,22) 36.
 //
 // The two thresholds form a hysteresis band. A scene parked on a single
-// boundary would otherwise flip modes on sensor noise alone, and a mode flip
-// bypasses the whole delta gate. Pink (255,200,200) scores 21, golden yellow
-// (255,191,96) 18.
+// boundary would otherwise alternate between modes on sensor noise alone,
+// wasting commands and making the tint chatter. Pink (255,200,200) scores 21,
+// golden yellow (255,191,96) 18.
 const TINT_ENTER_COLOR = 20;   // rise above this to leave white mode
 const TINT_STAY_COLOR  = 12;   // fall below this to return to white mode
-
-// A mode change has to be wanted this long before it is made, so a white flash
-// in a colored scene (or the reverse) does not cost two snaps. Realtime only;
-// a timed glide switches on its last step instead.
-const MODE_HOLD_MS = 1000;
-let modeWantedSince = null;
 
 const DIM_SAT_STAY_COLOR = 30;
 
@@ -97,7 +89,8 @@ const CCT_NEUTRAL    = 6500;   // D65, the sRGB white point
 // how far the settled white can sit from the screen, so two crossfades onto the
 // same white from different covers can differ by up to twice this. Measured on
 // an eased crossfade: 120 leaves a 133K spread, 60 converges exactly, and the
-// extra traffic stays well under the ceiling frameSkip already imposes.
+// extra traffic stays well under the ceiling frameSkip already imposes. Kelvin
+// now moves in 50 K steps (whiteTint's search grid).
 const CCT_DELTA = 60;
 
 // Clamp range accepted by the Tapo color-temperature API (Kelvin)
@@ -162,7 +155,7 @@ let lastLoginFailure = null;   // status of the last failed login, to log it onc
 
 export function Name()      { return "Tapo"; }
 export function Publisher() { return "SignalRGB Community"; }
-export function Version()   { return "3.3.0"; }
+export function Version()   { return "3.4.0"; }
 export function Type()      { return "network"; }
 
 export function SubdeviceController() { return true; }
@@ -604,7 +597,7 @@ export function Render() {
         if (glideTo === null || glideStep >= glideSteps || now < stepDue || requestPending) return;
 
         glideStep++;
-        [r, g, b] = glideSent = mixColors(glideFrom, glideTo, glideStep / glideSteps);
+        [r, g, b] = mixColors(glideFrom, glideTo, glideStep / glideSteps);
     } else {
         sumR = sumG = sumB = sampleCount = 0;
         glideFrom = glideTo = glideSent = null;
@@ -625,29 +618,19 @@ export function Render() {
     const scaledBri = Math.max(minBri, Math.round(v * (parseInt(brightnessPct()) / 100)));
     const minDelta  = controller.minDelta;
     const chroma    = Math.max(r, g, b) - Math.min(r, g, b);
-    const cct       = trustedCct(r, g, b, v, chroma);
+    // One Kelvin model: whiteTint finds the nearest blackbody white, and that
+    // same Kelvin is what white mode sends. The tint also picks the bulb mode,
+    // with hysteresis around the boundary and a floor for very dark scenes.
+    const [tint, k] = whiteTint([r, g, b]);
+    const cct       = trustedCct(k, v, chroma);
 
-    // Pick the bulb mode from the distance to the blackbody whites, with
-    // hysteresis around the boundary and a floor for very dark scenes.
     let mode;
     if (v < DARK_V_FLOOR) {
         const fadingColor = lastMode === "hs" && s >= DIM_SAT_STAY_COLOR && chroma >= DARK_CHROMA_STAY_COLOR;
         mode = fadingColor ? "hs" : "cct";
         if (fadingColor) { h = lastHue; s = lastSat; }
     }
-    else mode = whiteTint([r, g, b]) > (lastMode === "hs" ? TINT_STAY_COLOR : TINT_ENTER_COLOR) ? "hs" : "cct";
-
-    // Hold back a mode change, sending this color in the current mode, until
-    // it has been wanted for MODE_HOLD_MS or a glide reaches its last step.
-    // While the bulb is off a change costs nothing, so it is made at once.
-    if (mode === lastMode || lastMode === null) modeWantedSince = null;
-    else if (modeWantedSince === null) modeWantedSince = Date.now();
-    if (modeWantedSince !== null && scaledBri > 0 && lastBri > 0) {
-        const hold = intervalMs > 0
-            ? glideStep < glideSteps
-            : Date.now() - modeWantedSince < MODE_HOLD_MS;
-        if (hold) mode = lastMode;
-    }
+    else mode = tint > (lastMode === "hs" ? TINT_STAY_COLOR : TINT_ENTER_COLOR) ? "hs" : "cct";
 
     // Gate on whatever this mode actually transmits. In white mode that is the
     // Kelvin value, which no combination of hue, saturation and brightness
@@ -673,6 +656,8 @@ export function Render() {
     lastBri  = scaledBri;
     lastCct  = cct;
     lastMode = mode;
+    // Only colors actually sent become the next glide's start.
+    if (intervalMs > 0) glideSent = [r, g, b];
 
     sendColor(h, s, scaledBri, mode, cct);
 }
@@ -864,6 +849,7 @@ function isLit(c) {
     return Math.max(...c) >= 2;
 }
 
+// ponytail: RGB blending passes near white between opposite colors (red↔cyan); blend by hue if that detour ever shows.
 // Blend two RGB colors at t (0–1). The peak channel is interpolated separately
 // so brightness moves in a straight line: a plain RGB mix of red and blue
 // passes through a half-bright purple, which would read as a dip.
@@ -901,16 +887,18 @@ function averageCanvas() {
     ];
 }
 
-// Distance from a color to the nearest blackbody white in CCT_MIN-CCT_MAX,
-// scaled to the color's brightness, on colorDistance's scale.
+// [distance, Kelvin] of the nearest blackbody white in CCT_MIN-CCT_MAX, scaled
+// to the color's brightness, on colorDistance's scale. The best Kelvin is also
+// the one sent in white mode.
 function whiteTint(rgb) {
     const peak = Math.max(...rgb);
-    let best = Infinity;
-    for (let k = CCT_MIN; k <= CCT_MAX; k += 100) {
+    let best = Infinity, bestK = CCT_NEUTRAL;
+    for (let k = CCT_MIN; k <= CCT_MAX; k += 50) {
         const white = kelvinToRgb(k).map((c) => c * peak / 255);
-        best = Math.min(best, colorDistance(rgb, white));
+        const d = colorDistance(rgb, white);
+        if (d < best) { best = d; bestK = k; }
     }
-    return best;
+    return [best, bestK];
 }
 
 // Blackbody color in sRGB (Tanner Helland's fit; this form holds for 2000-6600K).
@@ -925,15 +913,14 @@ function kelvinToRgb(k) {
 
 // Color temperature for a frame, faded toward the display white point as the
 // scene gets too dark for its chromaticity to mean anything.
-function trustedCct(r, g, b, v, chroma) {
+function trustedCct(k, v, chroma) {
     const ramp = (x, lo, hi) => Math.min(1, Math.max(0, (x - lo) / (hi - lo)));
     const w = Math.min(
         ramp(v,      CCT_TRUST_V_LO, CCT_TRUST_V_HI),
         ramp(chroma, CCT_TRUST_C_LO, CCT_TRUST_C_HI),
     );
     if (w === 0) return CCT_NEUTRAL;
-    const raw = rgbToCct(r, g, b);
-    return Math.round(CCT_NEUTRAL + w * (raw - CCT_NEUTRAL));
+    return Math.round(CCT_NEUTRAL + w * (k - CCT_NEUTRAL));
 }
 
 // Shortest angular distance between two hues, in degrees (0–180). Hue is
@@ -972,38 +959,6 @@ function rgbToHsv(r, g, b) {
         Math.min(100, Math.max(1, Math.round(s))),
         Math.min(100, Math.max(0, Math.round(v)))
     ];
-}
-
-// RGB (0–255) → correlated color temperature in Kelvin, via sRGB → XYZ → xy
-// and McCamy's approximation. Used for near-white colors, where hue/saturation
-// cannot express the tint the canvas is asking for.
-function rgbToCct(r, g, b) {
-    // Linearize sRGB
-    const lin = (c) => {
-        c /= 255;
-        return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
-    };
-    const R = lin(r), G = lin(g), B = lin(b);
-
-    const X = R * 0.4124 + G * 0.3576 + B * 0.1805;
-    const Y = R * 0.2126 + G * 0.7152 + B * 0.0722;
-    const Z = R * 0.0193 + G * 0.1192 + B * 0.9505;
-
-    const sum = X + Y + Z;
-    if (sum === 0) return 4000;
-
-    const x = X / sum;
-    const y = Y / sum;
-
-    // McCamy: n = (x - 0.3320) / (0.1858 - y)
-    const denom = 0.1858 - y;
-    if (Math.abs(denom) < 1e-6) return 4000;
-    const n = (x - 0.3320) / denom;
-
-    const cct = 437 * n * n * n + 3601 * n * n + 6861 * n + 5517;
-    if (!isFinite(cct)) return 4000;
-
-    return Math.round(Math.min(CCT_MAX, Math.max(CCT_MIN, cct)));
 }
 
 function hexToRgb(hex) {
