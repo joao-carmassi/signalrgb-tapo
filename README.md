@@ -74,7 +74,7 @@ The discovered device list is cached, so tapo-rest does not need to be running w
 | Field | Default | Description |
 |---|---|---|
 | Frame Skip | `6` | Frames between color sends. `6` ≈ 5 fps at SignalRGB's 30 fps tick. Lower = more responsive, more API calls. |
-| Min Delta | `3` | Minimum HSV change (0–100) required to trigger a send. `0` sends every frame (after skip). Higher = less chatter. |
+| Min Delta | `3` | Minimum change in hue/saturation/brightness (0–100) required to send; color temperature uses a fixed 60 K threshold. `0` sends every frame (after skip). Higher = less chatter. |
 
 ### Per-device (device settings panel)
 
@@ -91,23 +91,18 @@ The discovered device list is cached, so tapo-rest does not need to be running w
 ## How It Works
 
 ```
-SignalRGB canvas
-      │
-      ▼  (every Nth frame)
-  averageCanvas()         ← reads LED channel colors
-      │
-      ▼
-  rgbToHsv()              ← convert to HSV
-      │
-      ▼
-  delta check             ← skip if color hasn't changed enough
-      │
-      ▼
-  tapo-rest REST API
-    POST /login           ← authenticate (token cached, re-auth on 401)
-    GET  /actions/{type}/on
-    GET  /actions/{type}/set-hue-saturation
-    GET  /actions/{type}/set-brightness
+canvas / Forced color
+  ▼ every Nth frame, or one color per Update Interval window glided in ~1 s steps
+pick mode: near a blackbody white (2500–6500 K) → color temperature, else hue/saturation (hysteresis)
+  ▼
+delta check (Min Delta on H/S/brightness; 60 K on Kelvin)
+  ▼
+tapo-rest
+  POST /login                       ← token cached, re-login on 401 / when tapo-rest returns
+  GET  /actions/{type}/set?brightness=&hue=&saturation=   or  &color_temperature=   (one device command)
+       fallback (older tapo-rest): /on + set-hue-saturation | set-color-temperature + set-brightness
+  GET  /actions/{type}/off          ← plugs only; dimmable lights stay at 1% so fades are not cut
+Shutdown: color lights → 3000 K, others → off
 ```
 
 The plugin uses SignalRGB's **network device / SubdeviceController** model. A single discovery service authenticates with tapo-rest, fetches the device list, and registers each device independently into the SignalRGB layout.
