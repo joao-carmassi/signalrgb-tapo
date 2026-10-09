@@ -618,7 +618,11 @@ export function Render() {
     }
 
     let [h, s, v] = rgbToHsv(r, g, b);
-    const scaledBri = Math.round(v * (parseInt(brightnessPct()) / 100));
+    // Dimmable devices never go below 1%: turning off and back on follows the
+    // device's own power animation, not the color fade, so a dark gap in the
+    // scene read as a cut. Switch-only devices still turn off.
+    const minBri    = deviceCaps(controller.deviceType).dim ? 1 : 0;
+    const scaledBri = Math.max(minBri, Math.round(v * (parseInt(brightnessPct()) / 100)));
     const minDelta  = controller.minDelta;
     const chroma    = Math.max(r, g, b) - Math.min(r, g, b);
     const cct       = trustedCct(r, g, b, v, chroma);
