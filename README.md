@@ -99,6 +99,8 @@ pick mode: near a blackbody white (2500–6500 K) → color temperature, else hu
   ▼
 delta check (Min Delta on H/S/brightness; 60 K on Kelvin)
   ▼
+color change with a brightness change under 30 → sent without brightness (it follows once the color settles)
+  ▼
 tapo-rest
   POST /login                       ← token cached, re-login on 401 / when tapo-rest returns
   GET  /actions/{type}/set?brightness=&hue=&saturation=   or  &color_temperature=   (one device command)
@@ -158,6 +160,10 @@ This is a limitation of the Tapo web service, not the plugin itself:
 - **L900** — Single color only by design. TP-Link does not expose per-segment control for this model at the hardware level. The entire strip always shows one solid color.
 
 - **L920 / L930** — These strips do have individually addressable segments, but TP-Link's Tapo web service does not expose per-segment color control through its API. Until the service exposes such an endpoint, per-segment support cannot be implemented.
+
+### Color changes and brightness fades (L530)
+
+The L530 ties a fade's length to its brightness change: a color change sent together with a small brightness change (a few points) jumps in about 100 ms. The plugin therefore sends color changes without brightness unless brightness moves by 30 or more, and sends the remaining brightness once the color settles. Lowering saturation (toward white or paler colors) is still quicker than other fades on this firmware.
 
 ---
 

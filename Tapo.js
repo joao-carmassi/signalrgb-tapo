@@ -1,5 +1,5 @@
 // =============================================================================
-// Tapo — SignalRGB Plugin  v3.6.1
+// Tapo — SignalRGB Plugin  v3.7.0
 // Supports all tapo-rest devices (L5xx, L6xx, L9xx, P1xx)
 // Requires: tapo-rest running locally (https://github.com/ClementNerma/tapo-rest)
 // Transport: XMLHttpRequest
@@ -97,6 +97,19 @@ const CCT_DELTA = 60;
 const CCT_MIN = 2500;
 const CCT_MAX = 6500;
 
+// L530 firmware: when one command changes the color (hue/sat, Kelvin, or
+// hs<->color_temp) AND brightness by a small amount (1-5 points), the fade
+// length is tied to the brightness change, so the color jumps in ~100 ms. The
+// same color change sent WITHOUT brightness fades over the full ~1 s. A large
+// brightness change (80<->20) fades smoothly. So brightness only rides along
+// with a color change when it moves at least this much; otherwise it is sent
+// in a later command once the color has settled. Calibration knob.
+const BRI_WITH_COLOR_MIN = 30;   // a brightness change this large rides along with a color change
+
+// About one device fade. A deferred brightness-only command is held back this
+// long after a color change, so it does not cut the color fade short.
+const BRI_HOLD_MS = 1000;
+
 let sessionToken   = null;
 let frameCounter   = 0;
 let requestPending = false;
@@ -104,6 +117,7 @@ let lastHue        = -1;
 let lastSat        = -1;
 let lastBri        = -1;
 let lastCct        = -1;
+let lastColorChangeAt = -Infinity;   // when the last color-changing command was sent
 let lastMode       = null;   // "hs" | "cct" — forces a resend when the mode flips
 
 // Timed updates (updateInterval > 0): one color per window, sent as one command
@@ -132,7 +146,7 @@ let lastLoginFailure = null;   // status of the last failed login, to log it onc
 
 export function Name()      { return "Tapo"; }
 export function Publisher() { return "SignalRGB Community"; }
-export function Version()   { return "3.6.1"; }
+export function Version()   { return "3.7.0"; }
 export function Type()      { return "network"; }
 
 export function SubdeviceController() { return true; }
@@ -615,13 +629,24 @@ export function Render() {
         Math.abs(scaledBri - lastBri) < Math.ceil(minDelta * Math.max(scaledBri, lastBri) / 100)
     ) return;
 
+    // A small brightness change sent with a color change shortens the color
+    // fade (see BRI_WITH_COLOR_MIN), so it is held back; lastBri stays at what
+    // the device still has, and the gate sends it once the color settles.
+    const colorChanged = mode !== lastMode || !colorSettled;
+    const sendBri = !deviceCaps(controller.deviceType).color || !colorChanged || lastBri < 0 ||
+        Math.abs(scaledBri - lastBri) >= BRI_WITH_COLOR_MIN || scaledBri === 0 || lastBri === 0;
+
+    // Held back, not dropped: the gate lets it through again on a later frame.
+    if (!colorChanged && !powerChanged && deviceCaps(controller.deviceType).color && Date.now() - lastColorChangeAt < BRI_HOLD_MS) return;
+    if (colorChanged) lastColorChangeAt = Date.now();
+
     lastHue  = h;
     lastSat  = s;
-    lastBri  = scaledBri;
+    if (sendBri) lastBri = scaledBri;
     lastCct  = cct;
     lastMode = mode;
 
-    sendColor(h, s, scaledBri, mode, cct);
+    sendColor(h, s, sendBri ? scaledBri : null, mode, cct);
 }
 
 export function Shutdown() {
@@ -708,7 +733,7 @@ function sendColor(hue, saturation, bri, mode, cct) {
     const dn   = controller.deviceName;
     const caps = deviceCaps(dt);
 
-    device.log(`[Tapo] [${dn}] sendColor mode=${mode} h=${hue} s=${saturation} v=${bri} cct=${cct} (color=${caps.color} dim=${caps.dim})`);
+    device.log(`[Tapo] [${dn}] sendColor mode=${mode} h=${hue} s=${saturation} v=${bri === null ? "-" : bri} cct=${cct} (color=${caps.color} dim=${caps.dim})`);
 
     // 401: the token expired or tapo-rest restarted. 0: tapo-rest is down.
     function handle401(status) {
@@ -750,7 +775,7 @@ function sendColor(hue, saturation, bri, mode, cct) {
     }
 
     if (caps.color && combinedSet !== false) {
-        httpGet(`/actions/${dt}/set?device=${dn}&brightness=${bri}&${colorParams}`, (status, body) => {
+        httpGet(`/actions/${dt}/set?device=${dn}&${bri === null ? "" : `brightness=${bri}&`}${colorParams}`, (status, body) => {
             if (handle401(status)) return;
             // An unknown route is a bare 404; a missing device carries a message.
             if (status === 404 && !body) {
@@ -779,6 +804,7 @@ function sendColor(hue, saturation, bri, mode, cct) {
             httpGet(colorPath, (s2) => {
                 if (handle401(s2)) return;
                 checkFailure(mode === "cct" ? "set-color-temperature" : "set-hue-saturation", s2);
+                if (bri === null) { requestPending = false; return; }
                 httpGet(`/actions/${dt}/set-brightness?device=${dn}&level=${bri}`, (s3) => {
                     if (handle401(s3)) return;
                     checkFailure("set-brightness", s3);
@@ -810,6 +836,7 @@ function colorDistance(a, b) {
 function invalidateSentState() {
     lastHue = lastSat = lastBri = lastCct = -1;
     lastMode = null;
+    lastColorChangeAt = -Infinity;
 }
 
 // -- Canvas / color helpers ---------------------------------------------------
