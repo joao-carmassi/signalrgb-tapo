@@ -85,7 +85,7 @@ The discovered device list is cached, so tapo-rest does not need to be running w
 | Lighting Mode | `Canvas` | `Canvas` syncs to screen average; `Forced` uses a fixed color |
 | Forced Color | `#0099ff` | Color used when Lighting Mode is set to Forced |
 | Brightness | `100%` | Scales the brightness output (1–100%) |
-| Update Interval (s) | `0` | Pick one color per N-second window and glide to it linearly, sending a step about every 0.3 s (none while nothing changes). Slow drifts stay continuous, and a step delayed by weak Wi-Fi jumps to where the glide should be instead of lagging behind. `0` keeps the Frame Skip behavior. |
+| Update Interval (s) | `1.5` | Pick one color per N-second window (steps of 0.5) and send it as a single command; the light does its own fade. Large changes fade smoothly over about 1 s; small ones finish sooner (the firmware fades at a fixed speed), so slow drifts move in soft pulses. `0` switches to realtime Frame Skip sends: more commands, and slow changes show stairs. |
 | Interval Sampling | `Average` | With an interval set: `Average` sends the mean color of the window (steady, but opposing colors blend); `Last Frame` sends the canvas as the window closes (vivid, but it catches an arbitrary beat). |
 
 ---
@@ -94,7 +94,7 @@ The discovered device list is cached, so tapo-rest does not need to be running w
 
 ```
 canvas / Forced color
-  ▼ every Nth frame, or one color per Update Interval window glided in ~0.3 s steps
+  ▼ every Nth frame, or one color per Update Interval window (default 1.5 s), sent as one command
 pick mode: near a blackbody white (2500–6500 K) → color temperature, else hue/saturation (hysteresis)
   ▼
 delta check (Min Delta on H/S/brightness; 60 K on Kelvin)

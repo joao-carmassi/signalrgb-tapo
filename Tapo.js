@@ -1,5 +1,5 @@
 // =============================================================================
-// Tapo — SignalRGB Plugin  v3.5.0
+// Tapo — SignalRGB Plugin  v3.6.0
 // Supports all tapo-rest devices (L5xx, L6xx, L9xx, P1xx)
 // Requires: tapo-rest running locally (https://github.com/ClementNerma/tapo-rest)
 // Transport: XMLHttpRequest
@@ -21,7 +21,7 @@ intervalSampling:readonly
 const lightingMode    = () => typeof LightingMode     !== "undefined" ? LightingMode     : "Canvas";
 const forcedColorHex  = () => typeof forcedColor      !== "undefined" ? forcedColor      : "0099ff";
 const brightnessPct   = () => typeof brightnessScale  !== "undefined" ? brightnessScale  : "100";
-const intervalSeconds = () => typeof updateInterval   !== "undefined" ? updateInterval   : "0";
+const intervalSeconds = () => typeof updateInterval   !== "undefined" ? updateInterval   : "1.5";
 const samplingMode    = () => typeof intervalSampling !== "undefined" ? intervalSampling : "Average";
 
 // -- Configuration ------------------------------------------------------------
@@ -106,22 +106,14 @@ let lastBri        = -1;
 let lastCct        = -1;
 let lastMode       = null;   // "hs" | "cct" — forces a resend when the mode flips
 
-// Timed updates (updateInterval > 0): one color per window, sent at its end,
-// leaving the device to fade to it. The first frame opens no window.
+// Timed updates (updateInterval > 0): one color per window, sent as one command
+// when the window closes, leaving the device to fade to it. The L530 fades at a
+// fixed speed, so intermediate steps finish early and read as stairs (tested on
+// the L530: 300 ms and 100 ms steps both stepped, one command per window faded
+// smoothly). The first frame opens no window.
 let windowStart = -Infinity;
 let sumR = 0, sumG = 0, sumB = 0, sampleCount = 0;
-
-// The move to each window's color is glided in small steps, so one device fade
-// runs straight into the next instead of change, pause, change.
-let glideFrom  = null;   // [r,g,b] the current glide starts from
-let glideTo    = null;   // [r,g,b] the window color it ends on
-let glideSent  = null;   // [r,g,b] the last step handed to the device
-
-// Timed mode sends at most one step per GLIDE_STEP_MS, each aimed at where
-// the glide is due. The L530 retargets a fade smoothly when commands arrive
-// 0.3 s apart. Calibration knob: raise to 400-500 if Wi-Fi gets worse.
-const GLIDE_STEP_MS = 300;
-let lastSendAt = -Infinity;
+let windowColor = null;   // [r,g,b] the last window's color, until it is sent
 
 // Whether tapo-rest has the combined `set` action. null until the first
 // attempt; false once the route turns out to be missing (older tapo-rest).
@@ -140,7 +132,7 @@ let lastLoginFailure = null;   // status of the last failed login, to log it onc
 
 export function Name()      { return "Tapo"; }
 export function Publisher() { return "SignalRGB Community"; }
-export function Version()   { return "3.5.0"; }
+export function Version()   { return "3.6.0"; }
 export function Type()      { return "network"; }
 
 export function SubdeviceController() { return true; }
@@ -510,8 +502,8 @@ export function ControllableParameters() {
             type:     "number",
             min:      "0",
             max:      "30",
-            step:     "1",
-            default:  "0"
+            step:     "0.5",
+            default:  "1.5"
         },
         {
             property: "intervalSampling",
@@ -546,8 +538,8 @@ export function Render() {
 
     if (intervalMs > 0) {
         // Every device command starts a fade that the next command cuts short,
-        // so a fast stream reads as hard cuts. One target per window, glided
-        // toward in ~GLIDE_STEP_MS steps.
+        // so a fast stream reads as hard cuts. One command per window, which the
+        // device fades to on its own.
         //   Average    — mean of the window; steady, never lands on the dark gap
         //                between beats, but opposing colors blend together.
         //   Last Frame — the canvas as the window closes; keeps colors vivid,
@@ -562,23 +554,16 @@ export function Render() {
                 : [sumR, sumG, sumB].map((sum) => Math.round(sum / sampleCount));
             sumR = sumG = sumB = sampleCount = 0;
             windowStart = now;
-
-            // Glide from what the device was last sent, so a late or gated
-            // step never jumps.
-            glideFrom = glideSent || target;
-            glideTo   = target;
+            windowColor = target;
         }
 
-        if (glideTo === null || requestPending || now - lastSendAt < GLIDE_STEP_MS) return;
-
-        // Time-based, so a late step (weak Wi-Fi) catches up instead of queueing
-        // lag. Aimed one step ahead, where the glide will be as this fade ends, so
-        // the bulb tracks the line and the window's last step lands on its color.
-        const t = Math.min(1, (now - windowStart + GLIDE_STEP_MS) / intervalMs);
-        [r, g, b] = mixColors(glideFrom, glideTo, t);
+        // Sent as soon as no request is in flight, so a slow one only delays it.
+        if (windowColor === null || requestPending) return;
+        [r, g, b] = windowColor;
+        windowColor = null;
     } else {
         sumR = sumG = sumB = sampleCount = 0;
-        glideFrom = glideTo = glideSent = null;
+        windowColor = null;
         frameCounter++;
         // A request still in flight at the boundary must not cost a whole extra skip.
         if (frameCounter < controller.frameSkip || requestPending) return;
@@ -635,8 +620,6 @@ export function Render() {
     lastBri  = scaledBri;
     lastCct  = cct;
     lastMode = mode;
-    // Only colors actually sent become the next glide's start.
-    if (intervalMs > 0) { glideSent = [r, g, b]; lastSendAt = Date.now(); }
 
     sendColor(h, s, scaledBri, mode, cct);
 }
@@ -716,7 +699,7 @@ function login() {
 function connectionLost() {
     sessionToken   = null;
     requestPending = false;
-    glideFrom = glideTo = glideSent = null;
+    windowColor = null;
     invalidateSentState();
 }
 
@@ -821,18 +804,6 @@ function sendColor(hue, saturation, bri, mode, cct) {
 function colorDistance(a, b) {
     const peak = Math.max(64, ...a, ...b);
     return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) / peak * 255;
-}
-
-// ponytail: RGB blending passes near white between opposite colors (red↔cyan); blend by hue if that detour ever shows.
-// Blend two RGB colors at t (0–1). The peak channel is interpolated separately
-// so brightness moves in a straight line: a plain RGB mix of red and blue
-// passes through a half-bright purple, which would read as a dip.
-function mixColors(from, to, t) {
-    const mixed = from.map((c, i) => c + (to[i] - c) * t);
-    const peak  = Math.max(...from) + (Math.max(...to) - Math.max(...from)) * t;
-    const max   = Math.max(...mixed);
-    const scale = max > 0 ? peak / max : 0;
-    return mixed.map((c) => Math.round(Math.min(255, c * scale)));
 }
 
 // Forget what was last sent, so the delta gate lets the next frame through.
